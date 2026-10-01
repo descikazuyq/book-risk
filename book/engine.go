@@ -2,14 +2,26 @@
 // 行情按连续序号推进，买卖单先占用资金/持仓，成交由调用方逐笔提交，
 // 并支持每个合约的最大持仓限额与完整的事件记录。
 //
+// 调用方还可用递增的正整数日号开启交易日并设置日内亏损上限（StartTradingDay、
+// SetLossLimit、RiskStatus）：当日内亏损（基准净值减当前净值，现金加持仓市值口径）
+// 达到或超过上限时，引擎拒绝一切新买单并按编号从大到小撤销全部有效买单，限制持续到
+// 下一交易日；未开日时不启用该保护，交易行为与基线完全一致。
+//
 // 所有金额、价格、数量均以整数最小单位表示；Engine 的方法会自行串行化，
 // 但业务流程仍由调用方驱动（不会自动撮合）。
 package book
 
 import (
+	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"sync"
 )
+
+// ErrInt64Overflow 表示风险保护启用期间，净值或亏损计算超出 int64 范围。
+// 返回该错误的开日、调限额、报价、成交调用整体不生效：除拒绝记录外不改变任何业务状态。
+var ErrInt64Overflow = errors.New("净值或亏损超出 int64 范围")
 
 // Side 表示买卖方向。
 type Side int
@@ -114,6 +126,54 @@ type FillResult struct {
 	Status    OrderStatus
 }
 
+// RiskTrigger 区分日内亏损保护首次触线的引发来源。
+type RiskTrigger int
+
+const (
+	// RiskTriggerStartDay 由开始交易日（含零上限）引发。
+	RiskTriggerStartDay RiskTrigger = iota + 1
+	// RiskTriggerAdjustLimit 由下调亏损上限（含任何使当前亏损达限的调整）引发。
+	RiskTriggerAdjustLimit
+	// RiskTriggerQuote 由报价生效引发。
+	RiskTriggerQuote
+	// RiskTriggerTrade 由成交入账引发。
+	RiskTriggerTrade
+)
+
+// String 返回触发来源的中文描述。
+func (t RiskTrigger) String() string {
+	switch t {
+	case RiskTriggerStartDay:
+		return "开日"
+	case RiskTriggerAdjustLimit:
+		return "调限额"
+	case RiskTriggerQuote:
+		return "报价"
+	case RiskTriggerTrade:
+		return "成交"
+	default:
+		return "未知触发"
+	}
+}
+
+// RiskValuation 是一次净值/亏损试算结果。亏损盈利时记零。
+type RiskValuation struct {
+	Equity int64 // 当前净值：现金 + 各合约持仓按最新已生效报价计算的市值
+	Loss   int64 // 日内亏损：基准净值 - 当前净值（小于 0 时记 0）
+}
+
+// RiskStatus 是日内亏损保护的查询结果。Open 为 false 表示尚未开始交易日，
+// 其余字段在未开日时均为零值。
+type RiskStatus struct {
+	Open       bool // 是否已开始交易日
+	Day        int64
+	Baseline   int64 // 当日基准净值
+	Equity     int64 // 当前净值
+	Loss       int64 // 当前日内亏损（盈利时为 0）
+	LossLimit  int64 // 当前亏损上限
+	Restricted bool  // 是否已限制增险
+}
+
 // RecordKind 区分事件记录类型。
 type RecordKind int
 
@@ -126,6 +186,8 @@ const (
 	RecordFilled
 	// RecordCanceled 订单撤销（含限额调整触发的撤销）。
 	RecordCanceled
+	// RecordRiskTriggered 日内亏损保护首次触线：一个交易日只产生一条。
+	RecordRiskTriggered
 )
 
 // String 返回记录类型的中文描述。
@@ -139,6 +201,8 @@ func (k RecordKind) String() string {
 		return "成交"
 	case RecordCanceled:
 		return "撤销"
+	case RecordRiskTriggered:
+		return "风险触线"
 	default:
 		return "未知记录"
 	}
@@ -171,6 +235,30 @@ type Record struct {
 	// 事件发生时该合约的最大持仓量快照。
 	MaxPositionValid bool
 	MaxPosition      int64
+
+	// 日内亏损保护快照（开日后的拒绝、撤销、成交与触线记录携带）。
+	RiskDay      int64
+	RiskBaseline int64
+	RiskEquity   int64
+	RiskLoss     int64
+	RiskLimit    int64
+	RiskRestrict bool
+
+	// 触线记录专有：触发来源与关联编号（报价序号或成交编号）。
+	RiskTrigger   RiskTrigger
+	RiskRefSeq    int64 // 报价引发时为报价序号；成交引发时为成交编号
+	RiskRefMoment int64 // 报价引发时为报价时刻
+
+	// 触线时计算所用的各持仓合约报价快照（仅 RecordRiskTriggered 携带）。
+	RiskQuoteRefs []RiskQuoteRef
+}
+
+// RiskQuoteRef 是触线净值计算所用的某个持仓合约最新报价定位。
+type RiskQuoteRef struct {
+	Symbol string
+	Seq    int64
+	Moment int64
+	Price  int64
 }
 
 // Engine 是单账户、多合约的本地模拟交易引擎。
@@ -186,6 +274,13 @@ type Engine struct {
 
 	// 已接受成交的幂等表：编号 -> 原始内容与结果。
 	fills map[int64]seenFill
+
+	// 日内亏损保护状态；riskOpen 为 false 时其余字段无意义，交易行为与基线一致。
+	riskOpen       bool
+	riskDay        int64
+	riskBaseline   int64 // 当日基准净值
+	riskLossLimit  int64 // 当前亏损上限
+	riskRestricted bool  // 触线后持续到下一交易日
 
 	records []Record
 }
@@ -342,6 +437,13 @@ func (e *Engine) Records() []Record {
 	defer e.mu.Unlock()
 	out := make([]Record, len(e.records))
 	copy(out, e.records)
+	for i := range out {
+		if out[i].RiskQuoteRefs != nil {
+			refs := make([]RiskQuoteRef, len(out[i].RiskQuoteRefs))
+			copy(refs, out[i].RiskQuoteRefs)
+			out[i].RiskQuoteRefs = refs
+		}
+	}
 	return out
 }
 
@@ -441,21 +543,45 @@ func (e *Engine) UpdateQuote(symbol string, q Quote) (int, error) {
 		return 0, nil
 	}
 
-	// q.Seq == latest+1：生效，并顺带让连续的等待报价依次生效。
-	applied := 0
-	cur := q
+	// q.Seq == latest+1：本次将生效的报价链（含连续的等待报价），先收集再处理。
+	chain := []Quote{q}
 	for {
+		next, ok := st.pending[chain[len(chain)-1].Seq+1]
+		if !ok {
+			break
+		}
+		chain = append(chain, next)
+	}
+
+	if e.riskOpen {
+		// 先逐条试算：任何一步使净值或亏损超出 int64，整批报价不生效。
+		for _, cur := range chain {
+			if _, _, ok := e.valuationHypoLocked(e.cash, symbol, st.position, false, cur, true); !ok {
+				e.appendRecord(Record{
+					Kind:   RecordRejected,
+					Symbol: symbol,
+					Reason: fmt.Sprintf("报价序号 %d 生效将使净值或亏损超出 int64 范围，整批拒绝", cur.Seq),
+				}, st)
+				return 0, fmt.Errorf("报价序号 %d: %w", cur.Seq, ErrInt64Overflow)
+			}
+		}
+	}
+
+	// 逐条生效；风险开启时每条真正生效的报价都重新计算风险。
+	// 即使中间价格触线、最后价格恢复，限制也已保留，不会解除。
+	applied := 0
+	for _, cur := range chain {
 		st.applied[cur.Seq] = cur
 		delete(st.pending, cur.Seq)
 		st.latest = cur
 		st.hasQuote = true
 		applied++
 
-		next, ok := st.pending[cur.Seq+1]
-		if !ok {
-			break
+		if e.riskOpen && !e.riskRestricted {
+			if val, refs, ok := e.valuationLocked(); ok && val.Loss >= e.riskLossLimit {
+				e.triggerRiskLocked(RiskTriggerQuote, cur.Seq, cur.Moment, val, refs)
+			}
 		}
-		cur = next
 	}
 	return applied, nil
 }
@@ -488,6 +614,10 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 
 	st := e.state(symbol)
 
+	if reason == "" && side == Buy && e.riskOpen && e.riskRestricted {
+		reason = fmt.Sprintf("交易日 %d 日内亏损保护已触发（亏损上限 %d），拒绝所有新买单",
+			e.riskDay, e.riskLossLimit)
+	}
 	if reason == "" && !st.maxSet {
 		reason = fmt.Sprintf("合约 %s 尚未设置最大持仓量", symbol)
 	}
@@ -611,6 +741,42 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	st := e.symbols[o.Symbol]
 	amount, _ := mulPositive(t.Price, t.Qty) // 接受委托时已校验过可乘性，此处必然安全
 
+	// 启用风险保护时：先在假设成交后的状态上试算净值。越界则整笔拒绝，
+	// 除拒绝记录外不改变任何业务状态（成交编号也不被占用）。
+	if e.riskOpen {
+		var hypoCash, hypoPos int64
+		arithOK := true
+		if o.Side == Buy {
+			hypoCash, arithOK = subInt64(e.cash, amount) // 成交金额不超过买单占用，余额不会为负
+			if arithOK {
+				hypoPos, arithOK = addInt64(st.position, t.Qty)
+			}
+		} else {
+			hypoCash, arithOK = addInt64(e.cash, amount)
+			if arithOK {
+				hypoPos, arithOK = subInt64(st.position, t.Qty) // 可卖校验保证持仓足量
+			}
+		}
+		if arithOK {
+			if _, _, ok := e.valuationHypoLocked(hypoCash, o.Symbol, hypoPos, true, Quote{}, false); !ok {
+				arithOK = false
+			}
+		}
+		if !arithOK {
+			e.appendRecord(Record{
+				Kind:       RecordRejected,
+				Symbol:     o.Symbol,
+				Side:       o.Side,
+				OrderID:    o.ID,
+				TradeID:    t.TradeID,
+				Qty:        t.Qty,
+				TradePrice: t.Price,
+				Reason:     fmt.Sprintf("成交 %d 入账将使净值或亏损超出 int64 范围，整笔拒绝", t.TradeID),
+			}, st)
+			return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
+		}
+	}
+
 	if o.Side == Buy {
 		// 释放限价占用，按实际成交金额扣现金；价差立即释放。
 		e.reservedCash -= o.Limit * t.Qty
@@ -653,6 +819,14 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 		Remaining:  o.Remaining(),
 		TradePrice: t.Price,
 	}, st)
+
+	// 成交先完整记账，再处理由它触发的风险触线撤单。
+	// 卖单成交也会重算风险（例如卖出亏损兑现），但限制一旦触发便不会因卖出盈利而解除。
+	if e.riskOpen && !e.riskRestricted {
+		if val, refs, ok := e.valuationLocked(); ok && val.Loss >= e.riskLossLimit {
+			e.triggerRiskLocked(RiskTriggerTrade, t.TradeID, 0, val, refs)
+		}
+	}
 	return res, nil
 }
 
@@ -758,6 +932,8 @@ func (e *Engine) appendReject(symbol string, side Side, qty, limit, orderID int6
 
 // appendRecord 在事件记录上固化当时的报价与持仓限额快照。
 // st 可能为 nil（例如空合约的非法输入），此时快照明确为空。
+// 交易日已开启时，还会固化当日风险快照（日号、基准、当前净值与亏损、上限、是否已限制），
+// 触线造成的拒绝与撤销据此可解释；后续行情、跨日与限额调整都不会改写这些记录。
 func (e *Engine) appendRecord(r Record, st *symbolState) {
 	if st != nil {
 		if st.hasQuote {
@@ -771,6 +947,17 @@ func (e *Engine) appendRecord(r Record, st *symbolState) {
 			r.MaxPosition = st.maxPosition
 		}
 	}
+	if e.riskOpen {
+		r.RiskDay = e.riskDay
+		r.RiskBaseline = e.riskBaseline
+		r.RiskLimit = e.riskLossLimit
+		r.RiskRestrict = e.riskRestricted
+		// 启用期间净值恒在 int64 范围内（越界变更此前已整体拒绝），溢出时仅留零值。
+		if val, _, ok := e.valuationLocked(); ok {
+			r.RiskEquity = val.Equity
+			r.RiskLoss = val.Loss
+		}
+	}
 	e.records = append(e.records, r)
 }
 
@@ -781,4 +968,271 @@ func mulPositive(a, b int64) (int64, bool) {
 		return 0, false
 	}
 	return r, true
+}
+
+// ---------------------------------------------------------------------------
+// 日内亏损保护
+//
+// 净值口径：现金余额 + 各合约持仓按最新已生效报价计算的市值。
+// 未成交买单占用的现金是现金余额的一部分（占用只是冻结，并未扣除），因此不重复扣减；
+// 跨号等待的报价不是“已生效报价”，不参与估值；无有效报价的持仓同样不计市值。
+// ---------------------------------------------------------------------------
+
+// valuationLocked 按当前状态试算净值与日内亏损。
+func (e *Engine) valuationLocked() (RiskValuation, []RiskQuoteRef, bool) {
+	return e.valuationHypoLocked(e.cash, "", 0, false, Quote{}, false)
+}
+
+// valuationHypoLocked 在假设状态上试算：可覆盖现金、某合约持仓与某合约报价，
+// 供成交后、报价逐条生效前在不改业务状态的前提下做溢出与触线检查。
+func (e *Engine) valuationHypoLocked(cash int64, hypoSym string, hypoPos int64, usePos bool,
+	hypoQuote Quote, useQuote bool) (RiskValuation, []RiskQuoteRef, bool) {
+
+	equity := cash
+	var refs []RiskQuoteRef
+
+	syms := make([]string, 0, len(e.symbols))
+	for s := range e.symbols {
+		syms = append(syms, s)
+	}
+	sort.Strings(syms)
+
+	for _, s := range syms {
+		st := e.symbols[s]
+		pos := st.position
+		if usePos && s == hypoSym {
+			pos = hypoPos
+		}
+		if pos == 0 {
+			continue // 空仓合约不参与估值，也无需留存报价
+		}
+		hasQuote := st.hasQuote
+		q := st.latest
+		if useQuote && s == hypoSym {
+			hasQuote = true
+			q = hypoQuote
+		}
+		if !hasQuote {
+			continue // 无已生效报价：该持仓暂不计市值
+		}
+		marketValue, ok := mulPosInt64(pos, q.Price)
+		if !ok {
+			return RiskValuation{}, nil, false
+		}
+		equity, ok = addInt64(equity, marketValue)
+		if !ok {
+			return RiskValuation{}, nil, false
+		}
+		refs = append(refs, RiskQuoteRef{Symbol: s, Seq: q.Seq, Moment: q.Moment, Price: q.Price})
+	}
+
+	loss, ok := subLoss(e.riskBaseline, equity)
+	if !ok {
+		return RiskValuation{}, nil, false
+	}
+	return RiskValuation{Equity: equity, Loss: loss}, refs, true
+}
+
+// subLoss 返回基准净值减当前净值；浮盈（差值为负）记零。差值溢出时 ok 为 false。
+func subLoss(baseline, equity int64) (int64, bool) {
+	diff, ok := subInt64(baseline, equity)
+	if !ok {
+		return 0, false
+	}
+	if diff < 0 {
+		return 0, true
+	}
+	return diff, true
+}
+
+// addInt64 做带溢出检查的有符号加法。
+func addInt64(a, b int64) (int64, bool) {
+	if b > 0 && a > math.MaxInt64-b {
+		return 0, false
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+// subInt64 做带溢出检查的有符号减法。
+func subInt64(a, b int64) (int64, bool) {
+	if b > 0 && a < math.MinInt64+b {
+		return 0, false
+	}
+	if b < 0 && a > math.MaxInt64+b {
+		return 0, false
+	}
+	return a - b, true
+}
+
+// mulPosInt64 返回 a*b；a 非负、b 为正，乘积溢出 int64 时 ok 为 false。
+func mulPosInt64(a, b int64) (int64, bool) {
+	if a < 0 || b <= 0 {
+		return 0, false
+	}
+	if a == 0 {
+		return 0, true
+	}
+	if a > math.MaxInt64/b {
+		return 0, false
+	}
+	return a * b, true
+}
+
+// triggerRiskLocked 首次触线处理：记录触线事件并按订单编号从大到小撤销全部有效买单。
+// 调用前须确认 riskOpen 且当前尚未限制；val/refs 为引发触线的那次试算结果
+// （报价批量生效时可能对应中间价格，必须原样固化）。
+func (e *Engine) triggerRiskLocked(trigger RiskTrigger, refID, refMoment int64,
+	val RiskValuation, refs []RiskQuoteRef) {
+
+	if e.riskRestricted {
+		return
+	}
+	e.riskRestricted = true
+
+	var refsCopy []RiskQuoteRef
+	if refs != nil {
+		refsCopy = make([]RiskQuoteRef, len(refs))
+		copy(refsCopy, refs)
+	}
+
+	e.records = append(e.records, Record{
+		Kind: RecordRiskTriggered,
+		Reason: fmt.Sprintf("日内亏损触线（%s）：基准净值 %d，当前净值 %d，亏损 %d，亏损上限 %d",
+			trigger, e.riskBaseline, val.Equity, val.Loss, e.riskLossLimit),
+		RiskDay:       e.riskDay,
+		RiskBaseline:  e.riskBaseline,
+		RiskEquity:    val.Equity,
+		RiskLoss:      val.Loss,
+		RiskLimit:     e.riskLossLimit,
+		RiskRestrict:  true,
+		RiskTrigger:   trigger,
+		RiskRefSeq:    refID,
+		RiskRefMoment: refMoment,
+		RiskQuoteRefs: refsCopy,
+	})
+
+	// 限制增险：撤销所有合约仍有未成交部分的买单，编号从大到小。
+	var ids []int64
+	for id, o := range e.orders {
+		if o.Side == Buy && o.Status != StatusCanceled && o.Status != StatusFilled && o.Remaining() > 0 {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] > ids[j] })
+	for _, id := range ids {
+		e.cancelLocked(e.orders[id],
+			fmt.Sprintf("日内亏损 %d 达到或超过上限 %d，风险保护撤销全部未成交买单", val.Loss, e.riskLossLimit))
+	}
+}
+
+// StartTradingDay 以递增的正整数日号和非负亏损上限开始交易日。
+// 跨日只由调用方明确发起，日号绝不从行情时刻推导。
+//
+// 开日时以现金余额加各合约持仓按最新已生效报价计算的市值作为当日基准净值；
+// 零上限在开日时立即触线。更大日号会重新确定基准并清除上一日的限制，
+// 但不恢复任何旧订单。同日号同上限的重复请求不产生变化；同日号不同上限、
+// 倒退日号、非正日号、负上限均报错且不改状态。
+func (e *Engine) StartTradingDay(day, lossLimit int64) error {
+	if day <= 0 {
+		return fmt.Errorf("交易日日号必须为正整数: %d", day)
+	}
+	if lossLimit < 0 {
+		return fmt.Errorf("亏损上限不能为负: %d", lossLimit)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.riskOpen {
+		switch {
+		case day < e.riskDay:
+			return fmt.Errorf("交易日日号不能倒退: 当前 %d，请求 %d", e.riskDay, day)
+		case day == e.riskDay && lossLimit != e.riskLossLimit:
+			return fmt.Errorf("交易日 %d 已开启（当前上限 %d），同日用不同上限 %d 重开被拒绝",
+				day, e.riskLossLimit, lossLimit)
+		case day == e.riskDay:
+			return nil // 同日同上限：幂等无操作
+		}
+	}
+
+	val, refs, ok := e.valuationLocked()
+	if !ok {
+		e.appendRecord(Record{
+			Kind:   RecordRejected,
+			Reason: fmt.Sprintf("开始交易日 %d 失败: %v", day, ErrInt64Overflow),
+		}, nil)
+		return fmt.Errorf("开始交易日 %d: %w", day, ErrInt64Overflow)
+	}
+
+	e.riskOpen = true
+	e.riskDay = day
+	e.riskBaseline = val.Equity
+	e.riskLossLimit = lossLimit
+	e.riskRestricted = false
+
+	if lossLimit == 0 {
+		// 零上限立即触线：当前亏损记 0，0 >= 0；保留基准计算所用的各持仓报价。
+		e.triggerRiskLocked(RiskTriggerStartDay, 0, 0, RiskValuation{Equity: val.Equity, Loss: 0}, refs)
+	}
+	return nil
+}
+
+// SetLossLimit 在当前交易日调整亏损上限（非负）。尚未开始交易日时调用报错。
+// 下调（或任何调整）使当前亏损达到或超过新上限时，立即触发与开日触线相同的限制处理；
+// 已限制时上调上限也不能解除限制。同值调整不产生变化。
+// 净值试算溢出时整体报错，除拒绝记录外不改变任何业务状态（含本次限额修改）。
+func (e *Engine) SetLossLimit(lossLimit int64) error {
+	if lossLimit < 0 {
+		return fmt.Errorf("亏损上限不能为负: %d", lossLimit)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if !e.riskOpen {
+		return fmt.Errorf("尚未开始交易日，不能调整亏损上限")
+	}
+	if lossLimit == e.riskLossLimit {
+		return nil
+	}
+
+	val, refs, ok := e.valuationLocked()
+	if !ok {
+		e.appendRecord(Record{
+			Kind:   RecordRejected,
+			Reason: fmt.Sprintf("调整亏损上限为 %d 失败: %v", lossLimit, ErrInt64Overflow),
+		}, nil)
+		return fmt.Errorf("调整亏损上限: %w", ErrInt64Overflow)
+	}
+
+	e.riskLossLimit = lossLimit
+	if !e.riskRestricted && val.Loss >= lossLimit {
+		e.triggerRiskLocked(RiskTriggerAdjustLimit, 0, 0, val, refs)
+	}
+	return nil
+}
+
+// RiskStatus 返回日内风险状态；未开始交易日时 Open 为 false，其余字段为零值，
+// 交易行为与未启用保护时完全一致。
+func (e *Engine) RiskStatus() RiskStatus {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.riskOpen {
+		return RiskStatus{Open: false}
+	}
+	st := RiskStatus{
+		Open:       true,
+		Day:        e.riskDay,
+		Baseline:   e.riskBaseline,
+		LossLimit:  e.riskLossLimit,
+		Restricted: e.riskRestricted,
+	}
+	if val, _, ok := e.valuationLocked(); ok {
+		st.Equity = val.Equity
+		st.Loss = val.Loss
+	}
+	return st
 }
