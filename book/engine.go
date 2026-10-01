@@ -124,8 +124,10 @@ const (
 	RecordRejected
 	// RecordFilled 成交记账成功。
 	RecordFilled
-	// RecordCanceled 订单撤销（含限额调整触发的撤销）。
+	// RecordCanceled 订单撤销（含限额调整或亏损触线触发的撤销）。
 	RecordCanceled
+	// RecordRiskTriggered 日内亏损触线限制增险。
+	RecordRiskTriggered
 )
 
 // String 返回记录类型的中文描述。
@@ -139,6 +141,8 @@ func (k RecordKind) String() string {
 		return "成交"
 	case RecordCanceled:
 		return "撤销"
+	case RecordRiskTriggered:
+		return "风险触线"
 	default:
 		return "未知记录"
 	}
@@ -171,6 +175,22 @@ type Record struct {
 	// 事件发生时该合约的最大持仓量快照。
 	MaxPositionValid bool
 	MaxPosition      int64
+
+	// 日内风险字段：风险触线记录及触线造成的拒绝/撤销记录填写，
+	// 用于保留当日亏损与上限，解释触线原因。
+	RiskDay      int64
+	RiskBaseline int64
+	RiskNetValue int64
+	RiskLoss     int64
+	RiskLimit    int64
+
+	// 触线引发方式与关联引用（仅风险触线记录填写）。
+	RiskTrigger  RiskTriggerKind
+	RiskQuoteSeq int64 // 引发触线的报价序号
+	RiskTradeID  int64 // 引发触线的成交编号
+
+	// 触线时各持仓合约的估值快照（仅风险触线记录填写）。
+	Valuations []PositionValuation
 }
 
 // Engine 是单账户、多合约的本地模拟交易引擎。
@@ -186,6 +206,9 @@ type Engine struct {
 
 	// 已接受成交的幂等表：编号 -> 原始内容与结果。
 	fills map[int64]seenFill
+
+	// 日内风险状态；nil 表示尚未开始交易日。
+	risk *riskState
 
 	records []Record
 }
@@ -441,23 +464,69 @@ func (e *Engine) UpdateQuote(symbol string, q Quote) (int, error) {
 		return 0, nil
 	}
 
-	// q.Seq == latest+1：生效，并顺带让连续的等待报价依次生效。
-	applied := 0
+	// 整理本次生效的报价序列：q 本身 + 补齐缺口后依次生效的跨号报价。
+	steps := make([]Quote, 0, 1)
 	cur := q
 	for {
-		st.applied[cur.Seq] = cur
-		delete(st.pending, cur.Seq)
-		st.latest = cur
-		st.hasQuote = true
-		applied++
-
+		steps = append(steps, cur)
 		next, ok := st.pending[cur.Seq+1]
 		if !ok {
 			break
 		}
 		cur = next
 	}
-	return applied, nil
+
+	// 日内风险：逐条试算估值，找到首次触线位置；任一报价导致净值超出
+	// int64 范围则整批报错、不改变任何业务状态（报价不生效、不触线）。
+	if e.risk != nil {
+		baseline := e.risk.baseline
+		savedLatest := st.latest
+		savedHasQuote := st.hasQuote
+		firstTrigger := -1
+		overflowAt := int64(0)
+		for i, qq := range steps {
+			st.latest = qq // 仅用于试算估值，循环结束后恢复
+			st.hasQuote = true
+			net, ok := e.valuationLocked()
+			if !ok {
+				overflowAt = qq.Seq
+				break
+			}
+			loss := lossLocked(baseline, net)
+			if firstTrigger < 0 && !e.risk.restricted && loss >= e.risk.limit {
+				firstTrigger = i
+			}
+		}
+		st.latest = savedLatest
+		st.hasQuote = savedHasQuote
+		if overflowAt > 0 {
+			return 0, fmt.Errorf("报价 %s 序号 %d 导致净值超出整数范围，报价未生效", symbol, overflowAt)
+		}
+
+		for _, qq := range steps {
+			st.applied[qq.Seq] = qq
+			delete(st.pending, qq.Seq)
+			st.latest = qq
+			st.hasQuote = true
+		}
+		if firstTrigger >= 0 {
+			tq := steps[firstTrigger]
+			// 触线记录按触线报价估值，触线后最新报价仍为最后生效的报价。
+			last := st.latest
+			st.latest = tq
+			e.triggerRiskLocked(RiskTriggerQuote, tq.Seq, 0)
+			st.latest = last
+		}
+		return len(steps), nil
+	}
+
+	for _, qq := range steps {
+		st.applied[qq.Seq] = qq
+		delete(st.pending, qq.Seq)
+		st.latest = qq
+		st.hasQuote = true
+	}
+	return len(steps), nil
 }
 
 // Buy 提交买单：按限价 × 数量占用现金，并计入最大持仓量占用。
@@ -498,6 +567,10 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 		reason = fmt.Sprintf("合约 %s 报价存在缺口（最新序号 %d，等待序号 %d），拒绝新买单",
 			symbol, st.latest.Seq, st.latest.Seq+1)
 	}
+	if reason == "" && side == Buy && e.risk != nil && e.risk.restricted {
+		_, loss, lim, _, _ := e.riskSnapshotLocked()
+		reason = fmt.Sprintf("日内亏损已触线（当前亏损 %d ≥ 上限 %d），拒绝新买单", loss, lim)
+	}
 	if reason == "" {
 		cost, ok := mulPositive(limit, qty)
 		if !ok {
@@ -520,6 +593,14 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 
 	if reason != "" {
 		e.appendReject(symbol, side, qty, limit, 0, reason)
+		if e.risk != nil && e.risk.restricted {
+			if _, loss, lim, _, ok := e.riskSnapshotLocked(); ok {
+				rec := &e.records[len(e.records)-1]
+				rec.RiskDay = e.risk.day
+				rec.RiskLoss = loss
+				rec.RiskLimit = lim
+			}
+		}
 		return 0, fmt.Errorf("%s %s 委托被拒绝: %s", side, symbol, reason)
 	}
 
@@ -611,6 +692,25 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	st := e.symbols[o.Symbol]
 	amount, _ := mulPositive(t.Price, t.Qty) // 接受委托时已校验过可乘性，此处必然安全
 
+	// 日内风险：先按成交入账后的状态试算净值；超出 int64 范围则整笔拒绝，
+	// 除拒绝记录外不改变任何业务状态（不记账、不占用成交编号）。
+	if e.risk != nil {
+		if _, ok := e.valuationAfterLocked(e.cash, st, o, t.Qty, amount); !ok {
+			reason := "成交后净值超出整数范围，整笔拒绝"
+			e.appendRecord(Record{
+				Kind:       RecordRejected,
+				Symbol:     t.Symbol,
+				Side:       t.Side,
+				OrderID:    t.OrderID,
+				TradeID:    t.TradeID,
+				Qty:        t.Qty,
+				TradePrice: t.Price,
+				Reason:     reason,
+			}, st)
+			return FillResult{}, fmt.Errorf("成交 %d 被拒绝: %s", t.TradeID, reason)
+		}
+	}
+
 	if o.Side == Buy {
 		// 释放限价占用，按实际成交金额扣现金；价差立即释放。
 		e.reservedCash -= o.Limit * t.Qty
@@ -653,6 +753,15 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 		Remaining:  o.Remaining(),
 		TradePrice: t.Price,
 	}, st)
+
+	// 成交本身先完整记账，再处理由它触发的撤单。
+	if e.risk != nil {
+		if net, ok := e.valuationLocked(); ok {
+			if loss := lossLocked(e.risk.baseline, net); loss >= e.risk.limit && !e.risk.restricted {
+				e.triggerRiskLocked(RiskTriggerFill, 0, t.TradeID)
+			}
+		}
+	}
 	return res, nil
 }
 
