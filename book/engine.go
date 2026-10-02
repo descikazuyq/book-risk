@@ -13,6 +13,12 @@
 // 该上限未设置时不改变任何基线行为，设置后跨交易日保留；与日内亏损保护不同，
 // 报价回落、卖出或上调上限后即可恢复买入，不做整日锁定。
 //
+// 调用方还可用 Modify 按订单编号修改待成交或部分成交订单的委托总量与限价：
+// 合约、方向、订单编号及已成交数量不变，旧占用（现金/可卖数量/持仓限额/金额
+// 上限）由新占用替换，历史成交不重新计价；取消剩余量仍走 Cancel。缺口期间买单
+// 只允许剩余量、现金与持仓金额占用均不增加的修改，被亏损保护撤销的订单不能
+// 借修改恢复。每次真实修改追加一条 RecordModified，重复提交当前参数不新增记录。
+//
 // 所有金额、价格、数量均以整数最小单位表示；Engine 的方法会自行串行化，
 // 但业务流程仍由调用方驱动（不会自动撮合）。
 package book
@@ -206,6 +212,8 @@ const (
 	RecordCanceled
 	// RecordRiskTriggered 日内亏损保护首次触线：一个交易日只产生一条。
 	RecordRiskTriggered
+	// RecordModified 已接受订单被成功修改（Old* 字段保存修改前参数）。
+	RecordModified
 )
 
 // String 返回记录类型的中文描述。
@@ -221,6 +229,8 @@ func (k RecordKind) String() string {
 		return "撤销"
 	case RecordRiskTriggered:
 		return "风险触线"
+	case RecordModified:
+		return "修改"
 	default:
 		return "未知记录"
 	}
@@ -237,8 +247,8 @@ type Record struct {
 	OrderID int64
 	TradeID int64
 
-	Limit     int64 // 委托限价（接受/拒绝委托时）
-	Qty       int64 // 委托数量，或本次成交量
+	Limit     int64 // 委托限价（接受/拒绝委托、修改及修改拒绝时；修改记录为新限价）
+	Qty       int64 // 委托数量（修改记录为新总量），或本次成交量
 	Filled    int64 // 事件发生后订单累计成交量
 	Remaining int64 // 事件发生后订单剩余量（撤销时为被取消的剩余量）
 
@@ -280,6 +290,12 @@ type Record struct {
 
 	// 金额判断时参与计算的各合约报价定位（上限相关拒绝、撤销携带）。
 	AmtQuoteRefs []RiskQuoteRef
+
+	// 修改记录专有（RecordModified）：修改前的限价、总量与当时已成交量；
+	// 修改后参数与成交量保存在 Limit/Qty/Filled 中。
+	OldLimit  int64
+	OldQty    int64
+	OldFilled int64
 }
 
 // RiskQuoteRef 是触线净值计算所用的某个持仓合约最新报价定位。
@@ -1066,6 +1082,270 @@ func (e *Engine) cancelLockedImpl(o *Order, reason string, amt *amtTotals) {
 		}
 	}
 	e.appendRecord(r, st)
+}
+
+// Modify 按订单编号修改一笔已接受订单的委托总量与限价。
+//
+// 只能修改待成交或部分成交订单；合约、方向、订单编号及已成交数量保持不变。
+// 新总量必须大于已成交量，新限价必须为正；不存在、已撤销或全部成交的订单以及
+// 不合法参数都会报错并追加一条拒绝记录，资金、持仓与其他订单占用保持原值。
+// 取消剩余量继续使用 Cancel。
+//
+// 修改时以新占用替换原订单的旧占用（现金/可卖数量/合约持仓限额/账户总持仓金额
+// 上限均按此口径，恰好等于额度允许；额度不足则拒绝，绝不为腾额度撤销其他订单）。
+// 历史成交不重新计价：例如买入总量 10、已成交 4 改为总量 8、限价 12 后，剩余 4
+// 只占用 48 现金，现金余额与已入账持仓不变；卖单只调整未成交部分占用的可卖数量。
+//
+// 有行情缺口时，买单修改只有在剩余量、现金占用、按现有口径计算的持仓金额占用均不
+// 增加时才允许，任一项增加即拒绝（等待补齐的报价不参与判断）；卖单修改仍可办理，
+// 但不得占用超过持仓的数量。日内亏损保护继续生效，被保护撤销的订单不能借修改恢复。
+// 修改不改变订单原先的接受顺序：后续限额下调或报价触发撤单仍沿用已有次序。
+//
+// 每次真实修改只追加一条 RecordModified，保存修改前后参数、已成交量、当时的报价
+// 与限额；金额上限拒绝时还保存修改前与申请后合计及参与计算的报价定位。对仍有效
+// 订单重复提交当前参数时成功返回但不新增记录。修改失败只追加一条拒绝记录。
+// 计算超出 int64 范围时返回包装 ErrInt64Overflow 的错误。
+func (e *Engine) Modify(orderID, newQty, newLimit int64) error {
+	var paramReason string
+	switch {
+	case newQty <= 0:
+		paramReason = fmt.Sprintf("修改后委托总量必须为正: %d", newQty)
+	case newLimit <= 0:
+		paramReason = fmt.Sprintf("修改后委托限价必须为正: %d", newLimit)
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	o := e.orders[orderID]
+	var reason string
+	switch {
+	case o == nil:
+		reason = fmt.Sprintf("订单 %d 不存在", orderID)
+	case o.Status == StatusCanceled:
+		reason = fmt.Sprintf("订单 %d 已撤销，不能修改", orderID)
+	case o.Status == StatusFilled:
+		reason = fmt.Sprintf("订单 %d 已全部成交，不能修改", orderID)
+	case paramReason != "":
+		reason = paramReason
+	case newQty <= o.Filled:
+		reason = fmt.Sprintf("修改后总量 %d 必须大于已成交数量 %d", newQty, o.Filled)
+	}
+	if reason != "" {
+		e.appendModifyRejectLocked(orderID, o, newQty, newLimit, reason, false, false, amtTotals{}, amtTotals{})
+		return fmt.Errorf("修改订单 %d 被拒绝: %s", orderID, reason)
+	}
+
+	st := e.state(o.Symbol)
+	oldLimit, oldQty := o.Limit, o.Qty
+	oldRemaining := oldQty - o.Filled
+	newRemaining := newQty - o.Filled
+
+	// 对仍有效订单重复提交当前参数：成功返回且不新增记录、不动任何占用。
+	if oldQty == newQty && oldLimit == newLimit {
+		return nil
+	}
+
+	overflow := false
+	var newCash, oldCash int64
+
+	// 金额口径占用（剩余量 × max(限价, 最新已生效报价)）只在缺口规则与金额上限
+	// 需要时才试算：未启用金额上限且无缺口时，报价再高也不影响修改。
+	var newAmtNeed, oldAmtNeed int64
+	needsComputed := false
+	computeNeeds := func() bool {
+		a, ok1 := amtNeed(st, newRemaining, newLimit)
+		b, ok2 := amtNeed(st, oldRemaining, oldLimit)
+		if !ok1 || !ok2 {
+			return false
+		}
+		newAmtNeed, oldAmtNeed, needsComputed = a, b, true
+		return true
+	}
+
+	if o.Side == Buy {
+		// 买单现金占用：限价 × 剩余量。
+		var ok bool
+		newCash, ok = mulPositive(newLimit, newRemaining)
+		if !ok {
+			overflow = true
+			reason = fmt.Sprintf("修改后限价 %d × 剩余量 %d 超出整数范围", newLimit, newRemaining)
+		}
+		oldCash = oldLimit * oldRemaining // 接受与成交时已校验过可乘性，必然安全
+		if reason == "" {
+			// 现金：原订单旧占用先释放、再由新占用替代；其他订单占用保留。
+			usedByOthers, ok1 := subInt64(e.reservedCash, oldCash)
+			available, ok2 := subInt64(e.cash, usedByOthers)
+			if !ok1 || !ok2 {
+				overflow = true
+				reason = "修改后现金占用计算超出 int64 范围，修改拒绝"
+			} else if newCash > available {
+				reason = fmt.Sprintf("修改后现金不足: 需要 %d，可用 %d（原占用 %d 由新占用替代）",
+					newCash, available, oldCash)
+			}
+		}
+		if reason == "" {
+			// 合约持仓限额：同样只替换本订单的旧占用。
+			newReserved, ok1 := subInt64(st.reservedBuy, oldRemaining)
+			newPositionUsed, ok2 := addInt64(st.position, newReserved)
+			newPositionUsed, ok3 := addInt64(newPositionUsed, newRemaining)
+			if !ok1 || !ok2 || !ok3 {
+				overflow = true
+				reason = "修改后持仓限额占用计算超出 int64 范围，修改拒绝"
+			} else if newPositionUsed > st.maxPosition {
+				reason = fmt.Sprintf("修改后超过最大持仓量 %d: 已持仓 %d + 买单剩余 %d",
+					st.maxPosition, st.position, newReserved+newRemaining)
+			}
+		}
+		if reason == "" && len(st.pending) > 0 {
+			// 行情缺口：剩余量、现金占用、按现有口径的持仓金额占用任一项增加即拒绝。
+			if !computeNeeds() {
+				overflow = true
+				reason = fmt.Sprintf("订单 %d 修改后持仓金额占用计算超出 int64 范围，修改拒绝", orderID)
+			} else if newRemaining > oldRemaining || newCash > oldCash || newAmtNeed > oldAmtNeed {
+				reason = fmt.Sprintf("合约 %s 报价存在缺口（最新序号 %d，等待序号 %d），买单修改不得增加剩余量、现金或持仓金额占用",
+					o.Symbol, st.latest.Seq, st.latest.Seq+1)
+			}
+		}
+	} else {
+		// 卖单只调整未成交部分占用的可卖数量；其他卖单占用保留。
+		usedByOthers, ok1 := subInt64(st.reservedSell, oldRemaining)
+		sellable, ok2 := subInt64(st.position, usedByOthers)
+		if !ok1 || !ok2 {
+			overflow = true
+			reason = "修改后可卖数量计算超出 int64 范围，修改拒绝"
+		} else if newRemaining > sellable {
+			reason = fmt.Sprintf("修改后可卖数量不足: 需要 %d，可卖 %d（持仓 %d，其他卖单占用 %d）",
+				newRemaining, sellable, st.position, usedByOthers)
+		}
+	}
+
+	// 账户总持仓金额上限：修改前合计减去本订单旧占用、加上新占用后不得超过上限
+	// （恰好等于允许）；额度不足只拒绝本次修改，不撤销其他订单。
+	var before, apply amtTotals
+	amtOverLimit := false
+	if reason == "" && o.Side == Buy && e.amtLimitSet {
+		b, okb := e.amountTotalsLocked()
+		if !okb || (!needsComputed && !computeNeeds()) {
+			overflow = true
+			reason = fmt.Sprintf("订单 %d 修改后账户总持仓金额计算超出 int64 范围，修改拒绝", orderID)
+		} else {
+			base, ok1 := subInt64(b.total, oldAmtNeed)
+			aTotal, ok2 := addInt64(base, newAmtNeed)
+			if !ok1 || !ok2 {
+				overflow = true
+				reason = fmt.Sprintf("订单 %d 修改后账户总持仓金额申请后合计超出 int64 范围，修改拒绝", orderID)
+			} else {
+				before = b
+				apply.total = aTotal
+				if aTotal > e.amtLimit {
+					amtOverLimit = true
+					reason = fmt.Sprintf("修改后超过账户总持仓金额上限 %d: 修改前合计 %d，申请后合计 %d（原占用由新占用替代，不撤销其他订单）",
+						e.amtLimit, b.total, aTotal)
+				}
+			}
+		}
+	}
+
+	if reason != "" {
+		// 金额上限“超额”拒绝需要修改前/申请后合计快照；溢出拒绝只固化启用状态与上限。
+		e.appendModifyRejectLocked(orderID, o, newQty, newLimit, reason, overflow,
+			amtOverLimit, before, apply)
+		if overflow {
+			return fmt.Errorf("修改订单 %d: %w", orderID, ErrInt64Overflow)
+		}
+		return fmt.Errorf("修改订单 %d 被拒绝: %s", orderID, reason)
+	}
+
+	// 真实修改：旧占用由新占用替代（各项校验已保证结果有界）。
+	if o.Side == Buy {
+		e.reservedCash += newCash - oldCash
+		st.reservedBuy += newRemaining - oldRemaining
+	} else {
+		st.reservedSell += newRemaining - oldRemaining
+	}
+	o.Limit = newLimit
+	o.Qty = newQty
+	if o.Filled > 0 {
+		o.Status = StatusPartial // newQty > Filled 保证仍有剩余量
+	}
+
+	e.appendRecord(Record{
+		Kind:      RecordModified,
+		Symbol:    o.Symbol,
+		Side:      o.Side,
+		OrderID:   o.ID,
+		Limit:     newLimit,
+		Qty:       newQty,
+		Filled:    o.Filled,
+		Remaining: o.Remaining(),
+		OldLimit:  oldLimit,
+		OldQty:    oldQty,
+		OldFilled: o.Filled,
+	}, st)
+	return nil
+}
+
+// amtNeed 按金额上限口径计算一笔买单剩余量在当前最新已生效报价下的占用：
+// 剩余量 × max(限价, 报价)；无有效报价时按限价计（买单接受后必有报价，此为兜底）。
+// 乘积溢出 int64 时 ok 为 false。
+func amtNeed(st *symbolState, remaining, limit int64) (int64, bool) {
+	unit := limit
+	if st.hasQuote && st.latest.Price > unit {
+		unit = st.latest.Price
+	}
+	return mulPosInt64(remaining, unit)
+}
+
+// appendModifyRejectLocked 追加修改拒绝记录；o 可能为 nil（订单不存在），
+// 此时以 reqOrderID 固化调用方提交的订单编号。金额上限超额拒绝（withAmt）固化
+// 修改前合计、申请后合计与参与计算的报价定位；溢出或未启用金额上限时不带金额明细。
+func (e *Engine) appendModifyRejectLocked(reqOrderID int64, o *Order, newQty, newLimit int64,
+	reason string, overflow, withAmt bool, before, apply amtTotals) {
+
+	var symbol string
+	var side Side
+	if o != nil {
+		symbol = o.Symbol
+		side = o.Side
+	}
+	r := Record{
+		Kind:    RecordRejected,
+		Symbol:  symbol,
+		Side:    side,
+		OrderID: reqOrderID,
+		Limit:   newLimit,
+		Qty:     newQty,
+		Reason:  reason,
+	}
+	if o != nil && e.amtLimitSet && (overflow || withAmt) {
+		r.AmtEnabled = true
+		r.AmtLimit = e.amtLimit
+		if withAmt {
+			r.AmtHolding = before.holding
+			r.AmtBuyReserved = before.reserved
+			r.AmtTotal = before.total
+			r.AmtApplyTotal = apply.total
+			refs := append([]RiskQuoteRef(nil), before.refs...)
+			if st := e.symbols[symbol]; st != nil && st.hasQuote {
+				found := false
+				for _, rf := range refs {
+					if rf.Symbol == symbol {
+						found = true
+						break
+					}
+				}
+				if !found {
+					refs = append(refs, RiskQuoteRef{
+						Symbol: symbol, Seq: st.latest.Seq, Moment: st.latest.Moment, Price: st.latest.Price,
+					})
+					sort.Slice(refs, func(i, j int) bool { return refs[i].Symbol < refs[j].Symbol })
+				}
+			}
+			r.AmtQuoteRefs = refs
+		}
+	}
+	e.appendRecord(r, e.symbols[symbol])
 }
 
 func (e *Engine) appendReject(symbol string, side Side, qty, limit, orderID int64, reason string) {
