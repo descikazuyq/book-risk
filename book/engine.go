@@ -33,8 +33,11 @@ import (
 
 // ErrInt64Overflow 表示风险保护或账户总持仓金额限额启用期间，净值、亏损或金额
 // 合计计算超出 int64 范围；或卖出成交所得加回现金余额后超出 int64 范围（现金结算
-// 检查始终生效，不依赖任何保护或限额是否开启）。返回该错误的开日、调限额、设置
-// 金额上限、报价、下单或成交调用整体不生效：除拒绝记录外不改变任何业务状态。
+// 检查始终生效，不依赖任何保护或限额是否开启）；或买单申请后
+// “已持仓数量 + 该合约有效买单剩余量 + 本次申请数量”合计超出 int64 范围
+// （合约持仓限额检查始终生效，三个数各自合法并不代表合计可表示）。
+// 返回该错误的开日、调限额、设置金额上限、报价、下单或成交调用整体不生效：
+// 除拒绝记录外不改变任何业务状态。
 var ErrInt64Overflow = errors.New("净值、亏损或持仓金额超出 int64 范围")
 
 // Side 表示买卖方向。
@@ -704,6 +707,9 @@ func (e *Engine) UpdateQuote(symbol string, q Quote) (int, error) {
 }
 
 // Buy 提交买单：按限价 × 数量占用现金，并计入最大持仓量占用。
+// 最大持仓量约束 已持仓数量 + 该合约其他有效买单剩余量 + 本次申请数量；
+// 合计超出 int64 可表示范围时整笔拒绝（返回零订单编号与包装 ErrInt64Overflow
+// 的错误，只追加一条拒绝记录，不消耗订单编号），不会因数值回绕接受超限委托。
 func (e *Engine) Buy(symbol string, qty, limit int64) (int64, error) {
 	return e.placeOrder(symbol, Buy, qty, limit)
 }
@@ -752,9 +758,6 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 		} else if side == Buy {
 			if cost > e.cash-e.reservedCash {
 				reason = fmt.Sprintf("现金不足: 需要 %d，可用 %d", cost, e.cash-e.reservedCash)
-			} else if st.position+st.reservedBuy+qty > st.maxPosition {
-				reason = fmt.Sprintf("超过最大持仓量 %d: 已持仓 %d + 买单剩余 %d + 本次 %d",
-					st.maxPosition, st.position, st.reservedBuy, qty)
 			}
 		} else {
 			sellable := st.position - st.reservedSell
@@ -762,6 +765,25 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 				reason = fmt.Sprintf("可卖数量不足: 需要 %d，可卖 %d（持仓 %d，卖单占用 %d）",
 					qty, sellable, st.position, st.reservedSell)
 			}
+		}
+	}
+
+	// 合约持仓限额：已持仓数量 + 该合约其他有效买单剩余量 + 本次申请数量。
+	// 三个数本身合法并不保证合计仍可用 int64 表示：合计溢出时不能让数值回绕后
+	// 绕过限额检查，否则会等到成交后才暴露负持仓。溢出时整笔拒绝并返回
+	// ErrInt64Overflow；合计可表示但超过限额时仍按原有超限原因拒绝。
+	// （卖单不占用持仓额度；卖单在真正成交前也不能提前抵减持仓。）
+	positionOverflow := false
+	if reason == "" && side == Buy {
+		used, ok1 := addInt64(st.position, st.reservedBuy)
+		apply, ok2 := addInt64(used, qty)
+		if !ok1 || !ok2 {
+			positionOverflow = true
+			reason = fmt.Sprintf("持仓数量合计超出 int64 范围: 本次申请 %d + 已持仓 %d + 有效买单剩余 %d 超过最大持仓量 %d，买单整体拒绝",
+				qty, st.position, st.reservedBuy, st.maxPosition)
+		} else if apply > st.maxPosition {
+			reason = fmt.Sprintf("超过最大持仓量 %d: 已持仓 %d + 买单剩余 %d + 本次 %d",
+				st.maxPosition, st.position, st.reservedBuy, qty)
 		}
 	}
 
@@ -800,6 +822,9 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 
 	if reason != "" {
 		e.appendReject(symbol, side, qty, limit, 0, reason)
+		if positionOverflow {
+			return 0, fmt.Errorf("%s %s 委托被拒绝: %w", side, symbol, ErrInt64Overflow)
+		}
 		return 0, fmt.Errorf("%s %s 委托被拒绝: %s", side, symbol, reason)
 	}
 
