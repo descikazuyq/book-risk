@@ -779,10 +779,9 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 			e.appendAmountRejectLocked(symbol, qty, limit, r, nil, 0, false)
 			return 0, fmt.Errorf("%s %s 委托被拒绝: %w", side, symbol, ErrInt64Overflow)
 		}
-		unit := limit // 每笔买单占用按剩余数量 × max(限价, 最新报价)
-		if st.hasQuote && st.latest.Price > unit {
-			unit = st.latest.Price
-		}
+		// 买单持仓金额占用统一按 剩余数量 × max(限价, 最新已生效报价) 取价，
+		// 与修改买单、账户金额汇总共用同一规则；现金占用仍单独按限价计（见上方）。
+		unit := buyAmountUnit(st, limit)
 		need, ok := mulPosInt64(qty, unit)
 		var apply int64
 		if ok {
@@ -1181,13 +1180,14 @@ func (e *Engine) Modify(orderID, newQty, newLimit int64) error {
 	overflow := false
 	var newCash, oldCash int64
 
-	// 金额口径占用（剩余量 × max(限价, 最新已生效报价)）只在缺口规则与金额上限
-	// 需要时才试算：未启用金额上限且无缺口时，报价再高也不影响修改。
+	// 持仓金额口径占用（剩余量 × max(限价, 最新已生效报价)）只在缺口规则与金额
+	// 上限需要时才试算：未启用金额上限且无缺口时，报价再高也不影响修改。
+	// 取价统一走 buyPositionAmount，与新买单、账户金额汇总共用同一条规则。
 	var newAmtNeed, oldAmtNeed int64
 	needsComputed := false
 	computeNeeds := func() bool {
-		a, ok1 := amtNeed(st, newRemaining, newLimit)
-		b, ok2 := amtNeed(st, oldRemaining, oldLimit)
+		a, ok1 := buyPositionAmount(st, newRemaining, newLimit)
+		b, ok2 := buyPositionAmount(st, oldRemaining, oldLimit)
 		if !ok1 || !ok2 {
 			return false
 		}
@@ -1318,15 +1318,32 @@ func (e *Engine) Modify(orderID, newQty, newLimit int64) error {
 	return nil
 }
 
-// amtNeed 按金额上限口径计算一笔买单剩余量在当前最新已生效报价下的占用：
-// 剩余量 × max(限价, 报价)；无有效报价时按限价计（买单接受后必有报价，此为兜底）。
-// 乘积溢出 int64 时 ok 为 false。
-func amtNeed(st *symbolState, remaining, limit int64) (int64, bool) {
-	unit := limit
-	if st.hasQuote && st.latest.Price > unit {
-		unit = st.latest.Price
+// higherAmountUnit 是取价规则本身：限价与一条已生效报价取较高者。
+// 所有“用限价还是报价”的判断都收敛到这里，禁止在各处理过程中重复比较。
+func higherAmountUnit(limit, quotePrice int64) int64 {
+	if quotePrice > limit {
+		return quotePrice
 	}
-	return mulPosInt64(remaining, unit)
+	return limit
+}
+
+// buyAmountUnit 是“买单未成交部分持仓金额占用”唯一的取价规则：取限价与该合约
+// 最新已生效报价中较高者；尚无有效报价时按限价计（买单接受后必有报价，此为兜底）。
+// 等待补齐的报价不是最新已生效报价，不会出现在 st.latest 中，因而不参与取价。
+// 接受新买单、修改买单与汇总账户金额都必须经由本函数取价，不得各自再判一次限价
+// 还是报价；现金占用始终按限价计算，与本口径区分，不走本函数。
+func buyAmountUnit(st *symbolState, limit int64) int64 {
+	if st.hasQuote {
+		return higherAmountUnit(limit, st.latest.Price)
+	}
+	return limit
+}
+
+// buyPositionAmount 按统一口径计算一笔买单给定剩余量的持仓金额占用：
+// 剩余量 × buyAmountUnit(限价, 最新已生效报价)。乘积溢出 int64 时 ok 为 false。
+// remaining 非负、limit 为正；remaining 为 0（已成交/已撤销）时占用为 0。
+func buyPositionAmount(st *symbolState, remaining, limit int64) (int64, bool) {
+	return mulPosInt64(remaining, buyAmountUnit(st, limit))
 }
 
 // appendModifyRejectLocked 追加修改拒绝记录；o 可能为 nil（订单不存在），
@@ -1874,11 +1891,9 @@ func (e *Engine) amountTotalsShadowLocked(quoteSym string, quote Quote, canceled
 			if rem <= 0 || !hasQuote {
 				continue // 买单接受时必有有效报价；无报价则不贡献占用
 			}
-			unit := o.Limit
-			if q.Price > unit {
-				unit = q.Price
-			}
-			need, ok := mulPosInt64(rem, unit)
+			// 取价规则与新买单、修改买单共用同一处实现；q 在影子试算时
+			// 代表该合约最新已生效报价（可能是补齐链中尚未落库的那条）。
+			need, ok := mulPosInt64(rem, higherAmountUnit(o.Limit, q.Price))
 			if !ok {
 				return amtTotals{}, false
 			}
