@@ -641,7 +641,10 @@ func (e *Engine) UpdateQuote(symbol string, q Quote) (int, error) {
 				}
 			}
 			if e.amtLimitSet {
-				t, ok := e.amountTotalsShadowLocked(symbol, cur, simCanceled)
+				// 与实际撤单共用同一套选择规则：本条报价的撤单承接此前各条
+				// 报价与亏损保护处理后的状态（simCanceled），选出的撤单再供
+				// 链中后续报价继续判断。
+				steps, ok := e.planAmountCancelLocked(symbol, cur, simCanceled)
 				if !ok {
 					e.appendRecord(Record{
 						Kind:       RecordRejected,
@@ -652,29 +655,8 @@ func (e *Engine) UpdateQuote(symbol string, q Quote) (int, error) {
 					}, st)
 					return 0, fmt.Errorf("报价序号 %d: %w", cur.Seq, ErrInt64Overflow)
 				}
-				if t.holding > e.amtLimit {
-					// 仅持仓金额超限：模拟撤光全部剩余买单。
-					for _, id := range e.activeBuyIDsShadowLocked(simCanceled) {
-						simCanceled[id] = true
-					}
-				} else {
-					for t.total > e.amtLimit {
-						ids := e.activeBuyIDsShadowLocked(simCanceled)
-						if len(ids) == 0 {
-							break
-						}
-						simCanceled[ids[0]] = true // 编号最大者先撤
-						var ok2 bool
-						t, ok2 = e.amountTotalsShadowLocked(symbol, cur, simCanceled)
-						if !ok2 {
-							e.appendRecord(Record{
-								Kind:   RecordRejected,
-								Symbol: symbol,
-								Reason: fmt.Sprintf("报价序号 %d 生效将使持仓金额或买单占用合计超出 int64 范围，整批拒绝", cur.Seq),
-							}, st)
-							return 0, fmt.Errorf("报价序号 %d: %w", cur.Seq, ErrInt64Overflow)
-						}
-					}
+				for _, step := range steps {
+					simCanceled[step.id] = true
 				}
 			}
 		}
@@ -1925,13 +1907,8 @@ func (e *Engine) amountTotalsShadowLocked(quoteSym string, quote Quote, canceled
 	return out, true
 }
 
-// activeBuyIDsLocked 返回全部仍有剩余量的买单编号，按编号从大到小排列。
-func (e *Engine) activeBuyIDsLocked() []int64 {
-	return e.activeBuyIDsShadowLocked(nil)
-}
-
-// activeBuyIDsShadowLocked 同 activeBuyIDsLocked，但将 simCanceled 中的编号
-// 视为已撤销（报价链预检时模拟本批此前各条报价造成的撤单）。
+// activeBuyIDsShadowLocked 返回全部仍有剩余量的买单编号，按编号从大到小排列；
+// simCanceled 中的编号视为已撤销（报价链预检时模拟本批此前各条报价造成的撤单）。
 func (e *Engine) activeBuyIDsShadowLocked(simCanceled map[int64]bool) []int64 {
 	var ids []int64
 	for id, o := range e.orders {
@@ -1946,46 +1923,92 @@ func (e *Engine) activeBuyIDsShadowLocked(simCanceled map[int64]bool) []int64 {
 	return ids
 }
 
-// enforceAmountLimitLocked 收敛超限状态，返回按撤销顺序排列的订单编号。
-// cause 用作文案中的引发来源（“设置账户总持仓金额上限”或“报价生效”）。
-// 调用前须确认 amtLimitSet；仅持仓金额超限时撤光全部买单，否则逐单撤销到合计不超限。
+// amtCancelStep 是金额上限收敛计划中的一步：撤销 id 订单的全部剩余量。
+// totals 为撤销该单之前（仍超限时）判断所用的金额快照，供撤单记录原样固化；
+// holdingOnly 表示该步属于“仅持仓金额超限、撤光全部剩余买单”的情形。
+type amtCancelStep struct {
+	id          int64
+	totals      amtTotals
+	holdingOnly bool
+}
+
+// planAmountCancelLocked 是账户总持仓金额上限撤单的唯一选择规则，供设置上限、
+// 连续报价与补齐缺口的整批预检和实际撤单共同使用，保证相同持仓与订单状态下
+// 得出一致的撤单结果。
+//
+// quoteSym 非空时以 quote 作为该合约的最新已生效报价（报价链预检）；base 中的
+// 订单编号视为已撤销（本批此前各条报价或亏损保护已撤）。规则：若仅持仓金额
+// 超限，则选出全部有效买单（编号从大到小），不自动卖出；否则自编号最大的买单
+// 起逐个选出并撤销全部剩余量，直到合计不再超限（恰好等于上限时保留订单）。
+// 返回的每一步都携带撤销前判断所用的金额快照；任一步金额乘积或合计溢出
+// int64 时 ok 为 false。
+func (e *Engine) planAmountCancelLocked(quoteSym string, quote Quote, base map[int64]bool) ([]amtCancelStep, bool) {
+	t, ok := e.amountTotalsShadowLocked(quoteSym, quote, base)
+	if !ok {
+		return nil, false
+	}
+
+	// 在 base 之上叠加本计划已选出的撤单，逐步试算后续状态。
+	sim := make(map[int64]bool, len(base))
+	for id := range base {
+		sim[id] = true
+	}
+
+	var steps []amtCancelStep
+
+	if t.holding > e.amtLimit {
+		// 仅持仓金额已超限：撤掉全部剩余买单，不自动卖出。
+		for _, id := range e.activeBuyIDsShadowLocked(sim) {
+			steps = append(steps, amtCancelStep{id: id, totals: t, holdingOnly: true})
+			sim[id] = true
+			// 撤单只减不增，重算必然可表示；快照供下一步记录固化。
+			t, _ = e.amountTotalsShadowLocked(quoteSym, quote, sim)
+		}
+		return steps, true
+	}
+
+	for t.total > e.amtLimit {
+		ids := e.activeBuyIDsShadowLocked(sim)
+		if len(ids) == 0 {
+			break // 兜底：无单可撤
+		}
+		id := ids[0] // 编号最大者先撤
+		steps = append(steps, amtCancelStep{id: id, totals: t})
+		sim[id] = true
+		t, ok = e.amountTotalsShadowLocked(quoteSym, quote, sim)
+		if !ok {
+			return nil, false
+		}
+	}
+	return steps, true
+}
+
+// enforceAmountLimitLocked 按 planAmountCancelLocked 选出的计划实际撤单，
+// 返回按撤销顺序排列的订单编号。cause 用作文案中的引发来源（“设置账户总持仓
+// 金额上限”或“报价生效”）。调用前须确认 amtLimitSet 且调用方已在变更生效前
+// 完成溢出预检。
 func (e *Engine) enforceAmountLimitLocked(cause string) []int64 {
 	if !e.amtLimitSet {
 		return nil
 	}
-	t, ok := e.amountTotalsLocked()
+	steps, ok := e.planAmountCancelLocked("", Quote{}, nil)
 	if !ok {
 		return nil // 调用方负责在变更生效前完成溢出预检
 	}
 
 	var canceled []int64
-
-	if t.holding > e.amtLimit {
-		// 仅持仓金额已超限：撤掉全部剩余买单，不自动卖出。
-		for _, id := range e.activeBuyIDsLocked() {
-			cur, _ := e.amountTotalsLocked()
-			e.cancelAmountLocked(e.orders[id], fmt.Sprintf(
-				"账户总持仓金额上限 %d：%s后仅持仓金额 %d 已超过上限，撤销买单全部剩余量",
-				e.amtLimit, cause, cur.holding), cur)
-			canceled = append(canceled, id)
+	for _, step := range steps {
+		o := e.orders[step.id]
+		var reason string
+		if step.holdingOnly {
+			reason = fmt.Sprintf("账户总持仓金额上限 %d：%s后仅持仓金额 %d 已超过上限，撤销买单全部剩余量",
+				e.amtLimit, cause, step.totals.holding)
+		} else {
+			reason = fmt.Sprintf("账户总持仓金额上限 %d：%s后持仓金额 %d 与买单剩余占用 %d 合计 %d 超限，按订单编号从大到小撤销买单全部剩余量",
+				e.amtLimit, cause, step.totals.holding, step.totals.reserved, step.totals.total)
 		}
-		return canceled
-	}
-
-	for t.total > e.amtLimit {
-		ids := e.activeBuyIDsLocked()
-		if len(ids) == 0 {
-			break // 兜底：无单可撤
-		}
-		id := ids[0] // 编号最大者
-		e.cancelAmountLocked(e.orders[id], fmt.Sprintf(
-			"账户总持仓金额上限 %d：%s后持仓金额 %d 与买单剩余占用 %d 合计 %d 超限，按订单编号从大到小撤销买单全部剩余量",
-			e.amtLimit, cause, t.holding, t.reserved, t.total), t)
-		canceled = append(canceled, id)
-		t, ok = e.amountTotalsLocked()
-		if !ok {
-			break // 预检已保证不会发生
-		}
+		e.cancelAmountLocked(o, reason, step.totals)
+		canceled = append(canceled, step.id)
 	}
 	return canceled
 }
