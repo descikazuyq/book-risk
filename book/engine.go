@@ -31,10 +31,10 @@ import (
 	"sync"
 )
 
-// ErrInt64Overflow 表示风险保护或账户总持仓金额限额启用期间，净值、亏损或金额
-// 合计计算超出 int64 范围。返回该错误的开日、调限额、设置金额上限、报价、下单或
-// 成交调用整体不生效：除拒绝记录外不改变任何业务状态。
-var ErrInt64Overflow = errors.New("净值、亏损或持仓金额超出 int64 范围")
+// ErrInt64Overflow 表示现金结算、风险保护或账户总持仓金额限额计算中，现金、净值、
+// 亏损或金额合计超出 int64 范围。返回该错误的开日、调限额、设置金额上限、报价、
+// 下单或成交调用整体不生效：除拒绝记录外不改变任何业务状态。
+var ErrInt64Overflow = errors.New("现金、净值、亏损或持仓金额超出 int64 范围")
 
 // Side 表示买卖方向。
 type Side int
@@ -839,6 +839,12 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 // 买入价不得高于限价，卖出价不得低于限价；成交量超过订单剩余量、
 // 订单不存在或已撤销时整笔拒绝，资金与持仓不变。
 //
+// 现金结算始终必须能以 int64 表示，与日内亏损保护是否开启、账户总持仓金额上限
+// 是否设置无关：卖出所得加入现金余额后超出 int64 范围时整笔拒绝（返回零值结果与
+// 包装 ErrInt64Overflow 的错误），只追加一条拒绝记录，不扣减持仓、不释放卖单的
+// 可卖数量占用，也不影响其他订单；部分成交的卖单只拒绝本次成交，此前已入账的
+// 现金、持仓与累计成交量保留。现金增加后恰好等于 int64 最大值允许。
+//
 // 幂等性：同一成交编号以相同内容再次提交时返回原结果且不新增事件，
 // 即使订单此后已撤销也不会再次记账；同一编号对应不同内容时报错且不改状态。
 // 被拒绝的成交不占用编号，修正内容后仍可用同一编号提交。
@@ -890,8 +896,29 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	st := e.symbols[o.Symbol]
 	amount, _ := mulPositive(t.Price, t.Qty) // 接受委托时已校验过可乘性，此处必然安全
 
+	// 现金结算能否表示必须始终检查，与是否开启日内亏损保护、是否设置账户总持仓
+	// 金额上限无关：卖出所得加入现金后超出 int64 范围时整笔拒绝，且必须发生在
+	// 释放卖单占用、扣减持仓之前，拒绝后现金、持仓、订单占用与其他订单全部不变。
+	if o.Side == Sell {
+		if _, ok := addInt64(e.cash, amount); !ok {
+			e.appendRecord(Record{
+				Kind:       RecordRejected,
+				Symbol:     o.Symbol,
+				Side:       o.Side,
+				OrderID:    o.ID,
+				TradeID:    t.TradeID,
+				Qty:        t.Qty,
+				TradePrice: t.Price,
+				Reason: fmt.Sprintf("卖出成交 %d（价格 %d × 数量 %d = %d）入账将使现金余额 %d 加成交所得后超出 int64 范围，整笔拒绝",
+					t.TradeID, t.Price, t.Qty, amount, e.cash),
+			}, st)
+			return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
+		}
+	}
+
 	// 启用风险保护时：先在假设成交后的状态上试算净值。越界则整笔拒绝，
 	// 除拒绝记录外不改变任何业务状态（成交编号也不被占用）。
+	// 卖出的现金可表示性已在上面无条件预检，此处只可能因净值/亏损越界而拒绝。
 	if e.riskOpen {
 		var hypoCash, hypoPos int64
 		arithOK := true
@@ -901,10 +928,8 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 				hypoPos, arithOK = addInt64(st.position, t.Qty)
 			}
 		} else {
-			hypoCash, arithOK = addInt64(e.cash, amount)
-			if arithOK {
-				hypoPos, arithOK = subInt64(st.position, t.Qty) // 可卖校验保证持仓足量
-			}
+			hypoCash, _ = addInt64(e.cash, amount)          // 上方已验证必然可表示
+			hypoPos, arithOK = subInt64(st.position, t.Qty) // 可卖校验保证持仓足量
 		}
 		if arithOK {
 			if _, _, ok := e.valuationHypoLocked(hypoCash, o.Symbol, hypoPos, true, Quote{}, false); !ok {

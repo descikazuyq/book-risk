@@ -1,6 +1,8 @@
 package book
 
 import (
+	"errors"
+	"math"
 	"strings"
 	"testing"
 )
@@ -526,6 +528,169 @@ func TestCancelUnfilledBuyReleasesCash(t *testing.T) {
 	o, _ := e.Order(id)
 	if o.Status != StatusCanceled || o.Remaining() != 0 {
 		t.Fatalf("订单应标记撤销: %+v", o)
+	}
+}
+
+func TestFillSellCashOverflowRejectedWithoutProtection(t *testing.T) {
+	// 未开启交易日、未设置账户总持仓金额上限：卖出所得加现金溢出仍必须整笔拒绝。
+	e, _ := NewEngine(math.MaxInt64 - 5)
+	mustSetMax(t, e, "A", 10)
+	mustQuote(t, e, "A", Quote{Seq: 1, Moment: 1, Price: 1}, 1)
+	id := mustBuy(t, e, "A", 1, 1)
+	if _, err := e.Fill(Trade{TradeID: 1, OrderID: id, Symbol: "A", Side: Buy, Price: 1, Qty: 1}); err != nil {
+		t.Fatal(err)
+	}
+	cash := e.Cash() // MaxInt64-6
+	if cash != math.MaxInt64-6 {
+		t.Fatalf("前置买入后现金应为 MaxInt64-6，实际 %d", cash)
+	}
+
+	sid := mustSell(t, e, "A", 1, 1)
+
+	// 以价格 10 提交卖出成交：成交金额 10 本身不溢出，但加回现金后无法表示。
+	res, err := e.Fill(Trade{TradeID: 7, OrderID: sid, Symbol: "A", Side: Sell, Price: 10, Qty: 1})
+	if !errors.Is(err, ErrInt64Overflow) {
+		t.Fatalf("卖出致现金溢出必须返回 ErrInt64Overflow，实际 %v", err)
+	}
+	if res != (FillResult{}) {
+		t.Fatalf("溢出成交必须返回零值成交结果，实际 %+v", res)
+	}
+
+	// 不得先释放占用或扣减持仓再报错。
+	if e.Cash() != cash {
+		t.Fatalf("拒绝后现金应保持 %d，实际 %d", cash, e.Cash())
+	}
+	if e.Position("A") != 1 || e.Sellable("A") != 0 {
+		t.Fatalf("拒绝后持仓 1、卖单仍占用 1 可卖: pos=%d sellable=%d", e.Position("A"), e.Sellable("A"))
+	}
+	o, _ := e.Order(sid)
+	if o.Status != StatusPending || o.Filled != 0 || o.Remaining() != 1 {
+		t.Fatalf("拒绝后卖单应保留原未成交数量: %+v", o)
+	}
+
+	// 只追加一条拒绝记录，原因明确，且保留成交编号、订单编号、合约、方向、成交价量
+	// 与拒绝当时的报价、持仓限额快照。
+	recs := e.Records()
+	last := recs[len(recs)-1]
+	if last.Kind != RecordRejected || last.TradeID != 7 || last.OrderID != sid ||
+		last.Symbol != "A" || last.Side != Sell || last.TradePrice != 10 || last.Qty != 1 {
+		t.Fatalf("拒绝记录内容错误: %+v", last)
+	}
+	if !strings.Contains(last.Reason, "现金") || !strings.Contains(last.Reason, "int64") {
+		t.Fatalf("拒绝原因应明确说明卖出所得加入现金后超出范围，实际 %q", last.Reason)
+	}
+	if !last.QuoteValid || last.QuoteSeq != 1 || last.QuotePrice != 1 ||
+		!last.MaxPositionValid || last.MaxPosition != 10 {
+		t.Fatalf("拒绝记录应保留当时报价与持仓限额快照: %+v", last)
+	}
+	for _, r := range recs {
+		if r.Kind == RecordFilled && r.TradeID == 7 {
+			t.Fatal("溢出成交不得追加成交记录")
+		}
+		if r.Kind == RecordCanceled || r.Kind == RecordRiskTriggered {
+			t.Fatalf("溢出成交不得追加撤销/风险触线记录: %+v", r)
+		}
+	}
+
+	// 其他订单及其资金占用不受影响：卖单本身不占用现金。
+	if e.ReservedCash() != 0 {
+		t.Fatalf("卖单不占用现金，reserved=%d", e.ReservedCash())
+	}
+
+	// 被拒绝的成交编号仍可用于修正后的成交：价格符合限价 1，现金恰好可表示。
+	res2, err := e.Fill(Trade{TradeID: 7, OrderID: sid, Symbol: "A", Side: Sell, Price: 6, Qty: 1})
+	if err != nil {
+		t.Fatalf("修正价格后同编号成交应成功: %v", err)
+	}
+	if res2.Status != StatusFilled || res2.Filled != 1 || res2.Remaining != 0 {
+		t.Fatalf("修正后成交结果错误: %+v", res2)
+	}
+	if e.Cash() != math.MaxInt64 || e.Position("A") != 0 || e.Sellable("A") != 0 {
+		t.Fatalf("成交金额 6 入账后现金应恰好为 MaxInt64: cash=%d pos=%d sellable=%d",
+			e.Cash(), e.Position("A"), e.Sellable("A"))
+	}
+
+	// 已成功入账的同编号同内容成交继续返回原结果，不因当前余额变化而重新结算。
+	res3, err := e.Fill(Trade{TradeID: 7, OrderID: sid, Symbol: "A", Side: Sell, Price: 6, Qty: 1})
+	if err != nil {
+		t.Fatalf("成功成交的幂等重放应返回原结果: %v", err)
+	}
+	if res3 != res2 {
+		t.Fatalf("幂等重放结果不一致: %+v vs %+v", res3, res2)
+	}
+	if e.Cash() != math.MaxInt64 || e.Position("A") != 0 {
+		t.Fatalf("幂等重放不得重新结算: cash=%d pos=%d", e.Cash(), e.Position("A"))
+	}
+}
+
+func TestFillSellCashOverflowPartialKeepsPriorFill(t *testing.T) {
+	// 已部分成交的卖单遇到现金溢出：只拒绝本次成交，之前入账的现金、持仓与累计量保留。
+	e, _ := NewEngine(math.MaxInt64 - 5)
+	mustSetMax(t, e, "A", 10)
+	mustQuote(t, e, "A", Quote{Seq: 1, Moment: 1, Price: 1}, 1)
+	id := mustBuy(t, e, "A", 2, 1)
+	if _, err := e.Fill(Trade{TradeID: 1, OrderID: id, Symbol: "A", Side: Buy, Price: 1, Qty: 2}); err != nil {
+		t.Fatal(err)
+	}
+	// 买入后现金 MaxInt64-7、持仓 2。
+	sid := mustSell(t, e, "A", 2, 1)
+
+	// 先成交 1 股 @1：现金 MaxInt64-6，持仓 1，卖单累计成交 1。
+	if _, err := e.Fill(Trade{TradeID: 2, OrderID: sid, Symbol: "A", Side: Sell, Price: 1, Qty: 1}); err != nil {
+		t.Fatal(err)
+	}
+	cash := e.Cash()
+	if cash != math.MaxInt64-6 || e.Position("A") != 1 {
+		t.Fatalf("前置部分成交状态错误: cash=%d pos=%d", cash, e.Position("A"))
+	}
+	n := len(e.Records())
+
+	// 再以 7 成交剩余 1 股：7 本身不溢出，加现金后溢出，只拒绝本次。
+	if _, err := e.Fill(Trade{TradeID: 3, OrderID: sid, Symbol: "A", Side: Sell, Price: 7, Qty: 1}); !errors.Is(err, ErrInt64Overflow) {
+		t.Fatalf("部分成交卖单致现金溢出必须返回 ErrInt64Overflow，实际 %v", err)
+	}
+	if e.Cash() != cash || e.Position("A") != 1 || e.Sellable("A") != 0 {
+		t.Fatalf("拒绝不得影响此前入账: cash=%d pos=%d sellable=%d", e.Cash(), e.Position("A"), e.Sellable("A"))
+	}
+	o, _ := e.Order(sid)
+	if o.Status != StatusPartial || o.Filled != 1 || o.Remaining() != 1 {
+		t.Fatalf("卖单应保持部分成交、剩余 1: %+v", o)
+	}
+	if len(e.Records()) != n+1 || e.Records()[len(e.Records())-1].Kind != RecordRejected {
+		t.Fatal("溢出只应追加一条拒绝记录")
+	}
+
+	// 编号 3 修正为价格 6：现金恰好 MaxInt64，持仓清零，卖单全部成交。
+	if _, err := e.Fill(Trade{TradeID: 3, OrderID: sid, Symbol: "A", Side: Sell, Price: 6, Qty: 1}); err != nil {
+		t.Fatalf("修正后成交应成功: %v", err)
+	}
+	if e.Cash() != math.MaxInt64 || e.Position("A") != 0 {
+		t.Fatalf("修正入账后现金应恰好 MaxInt64: cash=%d pos=%d", e.Cash(), e.Position("A"))
+	}
+	o, _ = e.Order(sid)
+	if o.Status != StatusFilled || o.Filled != 2 {
+		t.Fatalf("卖单应全部成交: %+v", o)
+	}
+}
+
+func TestFillSellCashOverflowIndependentOfAmountLimit(t *testing.T) {
+	// 设置了账户总持仓金额上限时，现金溢出仍按现金结算规则拒绝（不依赖该上限）。
+	e, _ := NewEngine(math.MaxInt64 - 5)
+	mustSetMax(t, e, "A", 10)
+	mustQuote(t, e, "A", Quote{Seq: 1, Moment: 1, Price: 1}, 1)
+	if _, err := e.SetPositionAmountLimit(math.MaxInt64); err != nil {
+		t.Fatal(err)
+	}
+	id := mustBuy(t, e, "A", 1, 1)
+	if _, err := e.Fill(Trade{TradeID: 1, OrderID: id, Symbol: "A", Side: Buy, Price: 1, Qty: 1}); err != nil {
+		t.Fatal(err)
+	}
+	sid := mustSell(t, e, "A", 1, 1)
+	if _, err := e.Fill(Trade{TradeID: 7, OrderID: sid, Symbol: "A", Side: Sell, Price: 10, Qty: 1}); !errors.Is(err, ErrInt64Overflow) {
+		t.Fatalf("设置金额上限时现金溢出仍必须返回 ErrInt64Overflow，实际 %v", err)
+	}
+	if e.Cash() != math.MaxInt64-6 || e.Position("A") != 1 {
+		t.Fatalf("拒绝不得改状态: cash=%d pos=%d", e.Cash(), e.Position("A"))
 	}
 }
 
