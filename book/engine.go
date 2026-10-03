@@ -32,8 +32,9 @@ import (
 )
 
 // ErrInt64Overflow 表示风险保护或账户总持仓金额限额启用期间，净值、亏损或金额
-// 合计计算超出 int64 范围。返回该错误的开日、调限额、设置金额上限、报价、下单或
-// 成交调用整体不生效：除拒绝记录外不改变任何业务状态。
+// 合计计算超出 int64 范围；或卖出成交所得加回现金余额后超出 int64 范围（现金结算
+// 检查始终生效，不依赖任何保护或限额是否开启）。返回该错误的开日、调限额、设置
+// 金额上限、报价、下单或成交调用整体不生效：除拒绝记录外不改变任何业务状态。
 var ErrInt64Overflow = errors.New("净值、亏损或持仓金额超出 int64 范围")
 
 // Side 表示买卖方向。
@@ -842,6 +843,10 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 // 幂等性：同一成交编号以相同内容再次提交时返回原结果且不新增事件，
 // 即使订单此后已撤销也不会再次记账；同一编号对应不同内容时报错且不改状态。
 // 被拒绝的成交不占用编号，修正内容后仍可用同一编号提交。
+//
+// 卖出成交的现金结算始终检查可表示性：卖出所得加回现金余额后超出 int64 范围时
+// 整笔拒绝（返回包装 ErrInt64Overflow 的错误），不依赖日内亏损保护是否开启，
+// 也不以设置账户总持仓金额上限为前提；现金增加后恰好等于 int64 最大值允许。
 func (e *Engine) Fill(t Trade) (FillResult, error) {
 	if t.TradeID <= 0 {
 		return FillResult{}, fmt.Errorf("成交编号必须为正: %d", t.TradeID)
@@ -890,6 +895,26 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	st := e.symbols[o.Symbol]
 	amount, _ := mulPositive(t.Price, t.Qty) // 接受委托时已校验过可乘性，此处必然安全
 
+	// 卖出成交的现金结算必须始终可表示：卖出所得加回现金余额后超出 int64 范围时
+	// 整笔拒绝，不依赖日内亏损保护是否开启，也不以设置账户总持仓金额上限为前提。
+	// 除一条拒绝记录外不改变任何业务状态（成交编号不被占用，持仓与卖单占用保留）。
+	if o.Side == Sell {
+		if _, ok := addInt64(e.cash, amount); !ok {
+			e.appendRecord(Record{
+				Kind:       RecordRejected,
+				Symbol:     o.Symbol,
+				Side:       o.Side,
+				OrderID:    o.ID,
+				TradeID:    t.TradeID,
+				Qty:        t.Qty,
+				TradePrice: t.Price,
+				Reason: fmt.Sprintf("卖出所得 %d 加入现金余额 %d 后超出 int64 范围，整笔拒绝",
+					amount, e.cash),
+			}, st)
+			return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
+		}
+	}
+
 	// 启用风险保护时：先在假设成交后的状态上试算净值。越界则整笔拒绝，
 	// 除拒绝记录外不改变任何业务状态（成交编号也不被占用）。
 	if e.riskOpen {
@@ -901,7 +926,7 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 				hypoPos, arithOK = addInt64(st.position, t.Qty)
 			}
 		} else {
-			hypoCash, arithOK = addInt64(e.cash, amount)
+			hypoCash, arithOK = addInt64(e.cash, amount) // 上方已预检，此处必然安全
 			if arithOK {
 				hypoPos, arithOK = subInt64(st.position, t.Qty) // 可卖校验保证持仓足量
 			}

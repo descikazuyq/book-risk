@@ -1,6 +1,8 @@
 package book
 
 import (
+	"errors"
+	"math"
 	"strings"
 	"testing"
 )
@@ -555,5 +557,110 @@ func TestGapAllowsSellCancelAndFill(t *testing.T) {
 	}
 	if e.Position("A") != 8 {
 		t.Fatalf("缺口期间卖出成交后持仓应为 8，实际 %d", e.Position("A"))
+	}
+}
+
+func TestSellFillCashOverflowRejectedWithoutRiskOpen(t *testing.T) {
+	// 未开启交易日、未设置金额上限：卖出所得加回现金后溢出 int64 也必须整笔拒绝。
+	e, _ := NewEngine(math.MaxInt64 - 5)
+	mustSetMax(t, e, "A", 10)
+	mustQuote(t, e, "A", Quote{Seq: 1, Moment: 1, Price: 1}, 1)
+	bid := mustBuy(t, e, "A", 1, 1)
+	if _, err := e.Fill(Trade{TradeID: 1, OrderID: bid, Symbol: "A", Side: Buy, Price: 1, Qty: 1}); err != nil {
+		t.Fatal(err)
+	}
+	cash := e.Cash() // MaxInt64-6
+	sid := mustSell(t, e, "A", 1, 1)
+	before := len(e.Records())
+
+	// 成交金额 10 本身未溢出，但加回现金后无法表示：整笔拒绝。
+	res, err := e.Fill(Trade{TradeID: 7, OrderID: sid, Symbol: "A", Side: Sell, Price: 10, Qty: 1})
+	if !errors.Is(err, ErrInt64Overflow) {
+		t.Fatalf("卖出现金溢出必须返回 ErrInt64Overflow，实际 %v", err)
+	}
+	if res != (FillResult{}) {
+		t.Fatalf("溢出拒绝必须返回零值成交结果，实际 %+v", res)
+	}
+	if e.Cash() != cash || e.Position("A") != 1 || e.Sellable("A") != 0 {
+		t.Fatalf("溢出成交不得改变资金与持仓: cash=%d pos=%d sellable=%d",
+			e.Cash(), e.Position("A"), e.Sellable("A"))
+	}
+	o, _ := e.Order(sid)
+	if o.Status != StatusPending || o.Remaining() != 1 {
+		t.Fatalf("卖单占用不得提前释放: %+v", o)
+	}
+
+	// 只追加一条拒绝记录，且固化成交要素与当时的报价、持仓限额快照。
+	recs := e.Records()
+	if len(recs) != before+1 {
+		t.Fatalf("只能追加一条拒绝记录，实际新增 %d 条", len(recs)-before)
+	}
+	rec := recs[len(recs)-1]
+	if rec.Kind != RecordRejected || rec.TradeID != 7 || rec.OrderID != sid ||
+		rec.Symbol != "A" || rec.Side != Sell || rec.TradePrice != 10 || rec.Qty != 1 {
+		t.Fatalf("拒绝记录要素错误: %+v", rec)
+	}
+	if !strings.Contains(rec.Reason, "超出") {
+		t.Fatalf("拒绝原因应说明加回现金后超出范围: %q", rec.Reason)
+	}
+	if !rec.QuoteValid || rec.QuoteSeq != 1 || rec.QuotePrice != 1 {
+		t.Fatalf("拒绝记录缺少报价快照: %+v", rec)
+	}
+	if !rec.MaxPositionValid || rec.MaxPosition != 10 {
+		t.Fatalf("拒绝记录缺少持仓限额快照: %+v", rec)
+	}
+
+	// 编号未被占用：修正价格后同编号可成交；现金恰好到达 MaxInt64 允许。
+	res, err = e.Fill(Trade{TradeID: 7, OrderID: sid, Symbol: "A", Side: Sell, Price: 6, Qty: 1})
+	if err != nil {
+		t.Fatalf("被溢出拒绝的成交编号应可复用: %v", err)
+	}
+	if e.Cash() != math.MaxInt64 || e.Position("A") != 0 {
+		t.Fatalf("修正后成交应正常入账: cash=%d pos=%d", e.Cash(), e.Position("A"))
+	}
+	if res.Status != StatusFilled || res.Filled != 1 || res.Remaining != 0 {
+		t.Fatalf("修正后成交结果错误: %+v", res)
+	}
+	// 已入账成交幂等重放：返回原结果，不因余额变化重新结算。
+	again, err := e.Fill(Trade{TradeID: 7, OrderID: sid, Symbol: "A", Side: Sell, Price: 6, Qty: 1})
+	if err != nil || again != res {
+		t.Fatalf("幂等重放应返回原结果: %+v, %v", again, err)
+	}
+	if e.Cash() != math.MaxInt64 {
+		t.Fatalf("幂等重放不得再次记账: cash=%d", e.Cash())
+	}
+}
+
+func TestSellFillCashOverflowPartialFillKept(t *testing.T) {
+	// 部分成交后的卖单遇到现金溢出：只拒绝本次成交，已入账部分保留。
+	e, _ := NewEngine(math.MaxInt64 - 12)
+	mustSetMax(t, e, "A", 10)
+	mustQuote(t, e, "A", Quote{Seq: 1, Moment: 1, Price: 1}, 1)
+	bid := mustBuy(t, e, "A", 2, 1)
+	if _, err := e.Fill(Trade{TradeID: 1, OrderID: bid, Symbol: "A", Side: Buy, Price: 1, Qty: 2}); err != nil {
+		t.Fatal(err)
+	}
+	sid := mustSell(t, e, "A", 2, 1)
+	if _, err := e.Fill(Trade{TradeID: 2, OrderID: sid, Symbol: "A", Side: Sell, Price: 5, Qty: 1}); err != nil {
+		t.Fatal(err)
+	}
+	cash := e.Cash() // MaxInt64-9
+
+	if _, err := e.Fill(Trade{TradeID: 3, OrderID: sid, Symbol: "A", Side: Sell, Price: 10, Qty: 1}); !errors.Is(err, ErrInt64Overflow) {
+		t.Fatalf("第二笔卖出现金溢出必须拒绝，实际 %v", err)
+	}
+	if e.Cash() != cash || e.Position("A") != 1 {
+		t.Fatalf("之前入账的现金与持仓必须保留: cash=%d pos=%d", e.Cash(), e.Position("A"))
+	}
+	o, _ := e.Order(sid)
+	if o.Filled != 1 || o.Remaining() != 1 || o.Status != StatusPartial {
+		t.Fatalf("卖单累计成交量与剩余量必须保留: %+v", o)
+	}
+	// 修正后同编号成交：按实际成交金额入账。
+	if _, err := e.Fill(Trade{TradeID: 3, OrderID: sid, Symbol: "A", Side: Sell, Price: 9, Qty: 1}); err != nil {
+		t.Fatalf("修正后同编号成交应成功: %v", err)
+	}
+	if e.Cash() != math.MaxInt64 || e.Position("A") != 0 {
+		t.Fatalf("修正后成交应正常入账: cash=%d pos=%d", e.Cash(), e.Position("A"))
 	}
 }
