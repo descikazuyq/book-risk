@@ -664,3 +664,125 @@ func TestSellFillCashOverflowPartialFillKept(t *testing.T) {
 		t.Fatalf("修正后成交应正常入账: cash=%d pos=%d", e.Cash(), e.Position("A"))
 	}
 }
+
+func TestBuyPositionSumOverflowRejected(t *testing.T) {
+	// 未开启交易日、未设置金额上限：已持仓、有效买单剩余与本次申请各自合法，
+	// 但合计超出 int64 可表示范围时必须整笔拒绝，不能因回绕接受超限委托。
+	const M = math.MaxInt64
+	e, _ := NewEngine(M)
+	mustSetMax(t, e, "A", M)
+	mustQuote(t, e, "A", Quote{Seq: 1, Moment: 1, Price: 1}, 1)
+
+	// 价格 1 买入并全部成交 M 份，再以价格 2 卖出 1 份：持仓 M-1、现金 2。
+	bid := mustBuy(t, e, "A", M, 1)
+	if _, err := e.Fill(Trade{TradeID: 1, OrderID: bid, Symbol: "A", Side: Buy, Price: 1, Qty: M}); err != nil {
+		t.Fatal(err)
+	}
+	sid := mustSell(t, e, "A", 1, 2)
+	if _, err := e.Fill(Trade{TradeID: 2, OrderID: sid, Symbol: "A", Side: Sell, Price: 2, Qty: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if e.Position("A") != M-1 || e.Cash() != 2 {
+		t.Fatalf("前置状态错误: pos=%d cash=%d", e.Position("A"), e.Cash())
+	}
+	before := len(e.Records())
+
+	// 申请买入 2 份：现金足够，但 M-1 + 0 + 2 超出 int64 上界，整笔拒绝。
+	id, err := e.Buy("A", 2, 1)
+	if !errors.Is(err, ErrInt64Overflow) {
+		t.Fatalf("持仓数量合计溢出必须返回包装 ErrInt64Overflow 的错误，实际 %v", err)
+	}
+	if id != 0 {
+		t.Fatalf("溢出拒绝必须返回零订单编号，实际 %d", id)
+	}
+
+	// 资金、持仓与现有订单均保持申请前的值。
+	if e.Cash() != 2 || e.ReservedCash() != 0 || e.AvailableCash() != 2 || e.Position("A") != M-1 {
+		t.Fatalf("溢出拒绝不得改变资金与持仓: cash=%d reserved=%d avail=%d pos=%d",
+			e.Cash(), e.ReservedCash(), e.AvailableCash(), e.Position("A"))
+	}
+	o, _ := e.Order(sid)
+	if o.Status != StatusFilled {
+		t.Fatalf("已有订单状态不得改变: %+v", o)
+	}
+
+	// 只追加一条拒绝记录：说明申请数量、已持仓、有效买单剩余量与最大持仓量，
+	// 并固化申请合约、限价及当时的报价与限额快照。
+	recs := e.Records()
+	if len(recs) != before+1 {
+		t.Fatalf("只能追加一条拒绝记录，实际新增 %d 条", len(recs)-before)
+	}
+	rec := recs[len(recs)-1]
+	if rec.Kind != RecordRejected || rec.Symbol != "A" || rec.Side != Buy ||
+		rec.Qty != 2 || rec.Limit != 1 || rec.OrderID != 0 {
+		t.Fatalf("拒绝记录要素错误: %+v", rec)
+	}
+	for _, want := range []string{"2", "9223372036854775806", "0", "9223372036854775807"} {
+		if !strings.Contains(rec.Reason, want) {
+			t.Fatalf("拒绝原因 %q 应包含 %q（申请数量/已持仓/买单剩余/最大持仓量）", rec.Reason, want)
+		}
+	}
+	if !rec.QuoteValid || rec.QuoteSeq != 1 || rec.QuotePrice != 1 {
+		t.Fatalf("拒绝记录缺少报价快照: %+v", rec)
+	}
+	if !rec.MaxPositionValid || rec.MaxPosition != M {
+		t.Fatalf("拒绝记录缺少持仓限额快照: %+v", rec)
+	}
+
+	// 被拒绝的申请不消耗订单编号：随后买入 1 份（合计恰好等于限额）仍可接受，
+	// 成交后持仓恰好为 M。
+	bid2 := mustBuy(t, e, "A", 1, 1)
+	if bid2 != 3 {
+		t.Fatalf("被拒绝的申请不得消耗订单编号，新买单编号应为 3，实际 %d", bid2)
+	}
+	if _, err := e.Fill(Trade{TradeID: 3, OrderID: bid2, Symbol: "A", Side: Buy, Price: 1, Qty: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if e.Position("A") != M || e.Cash() != 1 {
+		t.Fatalf("成交后持仓应恰好为 M: pos=%d cash=%d", e.Position("A"), e.Cash())
+	}
+}
+
+func TestBuyPositionSumOverflowWithReservedBuy(t *testing.T) {
+	// 有效买单剩余量参与合计：部分成交只计未成交部分，已撤销订单不再占用额度。
+	const M = math.MaxInt64
+	e, _ := NewEngine(M)
+	mustSetMax(t, e, "A", M)
+	mustQuote(t, e, "A", Quote{Seq: 1, Moment: 1, Price: 1}, 1)
+
+	// 持仓 M-2，另有委托 2 份、已成交 1 份的有效买单（剩余量 1 计入合计）。
+	bid := mustBuy(t, e, "A", M, 1)
+	if _, err := e.Fill(Trade{TradeID: 1, OrderID: bid, Symbol: "A", Side: Buy, Price: 1, Qty: M}); err != nil {
+		t.Fatal(err)
+	}
+	sid := mustSell(t, e, "A", 3, 3)
+	if _, err := e.Fill(Trade{TradeID: 2, OrderID: sid, Symbol: "A", Side: Sell, Price: 3, Qty: 3}); err != nil {
+		t.Fatal(err)
+	}
+	open := mustBuy(t, e, "A", 2, 1)
+	if _, err := e.Fill(Trade{TradeID: 3, OrderID: open, Symbol: "A", Side: Buy, Price: 1, Qty: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if e.Position("A") != M-2 {
+		t.Fatalf("前置持仓应为 M-2，实际 %d", e.Position("A"))
+	}
+
+	// 申请 2 份：M-2 + 1 + 2 超出 int64 上界，整笔拒绝且不消耗订单编号。
+	if id, err := e.Buy("A", 2, 1); !errors.Is(err, ErrInt64Overflow) || id != 0 {
+		t.Fatalf("计入有效买单剩余后合计溢出必须拒绝，实际 id=%d err=%v", id, err)
+	}
+	// 申请 1 份：M-2 + 1 + 1 恰好等于限额，允许（部分成交订单只计未成交的 1 份，
+	// 若误计委托总量 2 份，本次申请将因溢出被拒绝）。
+	extra := mustBuy(t, e, "A", 1, 1)
+	if extra != 4 {
+		t.Fatalf("被拒绝的申请不得消耗订单编号，新买单编号应为 4，实际 %d", extra)
+	}
+
+	// 撤销部分成交的买单后剩余量释放：同样的申请仍然恰好到达限额，可接受。
+	if err := e.Cancel(open); err != nil {
+		t.Fatal(err)
+	}
+	if id := mustBuy(t, e, "A", 1, 1); id != 5 {
+		t.Fatalf("撤销后应可继续接受，新买单编号应为 5，实际 %d", id)
+	}
+}

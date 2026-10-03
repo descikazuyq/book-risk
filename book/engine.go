@@ -33,8 +33,10 @@ import (
 
 // ErrInt64Overflow 表示风险保护或账户总持仓金额限额启用期间，净值、亏损或金额
 // 合计计算超出 int64 范围；或卖出成交所得加回现金余额后超出 int64 范围（现金结算
-// 检查始终生效，不依赖任何保护或限额是否开启）。返回该错误的开日、调限额、设置
-// 金额上限、报价、下单或成交调用整体不生效：除拒绝记录外不改变任何业务状态。
+// 检查始终生效，不依赖任何保护或限额是否开启）；或新买单的持仓数量合计（已持仓 +
+// 有效买单剩余 + 本次申请）超出 int64 可表示范围（该检查同样始终生效，三个加数各自
+// 合法并不意味着合计可表示）。返回该错误的开日、调限额、设置金额上限、报价、下单
+// 或成交调用整体不生效：除拒绝记录外不改变任何业务状态。
 var ErrInt64Overflow = errors.New("净值、亏损或持仓金额超出 int64 范围")
 
 // Side 表示买卖方向。
@@ -752,9 +754,22 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 		} else if side == Buy {
 			if cost > e.cash-e.reservedCash {
 				reason = fmt.Sprintf("现金不足: 需要 %d，可用 %d", cost, e.cash-e.reservedCash)
-			} else if st.position+st.reservedBuy+qty > st.maxPosition {
-				reason = fmt.Sprintf("超过最大持仓量 %d: 已持仓 %d + 买单剩余 %d + 本次 %d",
-					st.maxPosition, st.position, st.reservedBuy, qty)
+			} else {
+				// 持仓数量合计（已持仓 + 有效买单剩余 + 本次申请）本身可能超出
+				// int64 可表示范围：三个加数各自合法并不意味着合计可表示。
+				// 溢出时不能把回绕后的数值当作真实合计与限额比较，必须整笔拒绝。
+				positionUsed, ok1 := addInt64(st.position, st.reservedBuy)
+				positionUsed, ok2 := addInt64(positionUsed, qty)
+				if !ok1 || !ok2 {
+					r := fmt.Sprintf("持仓数量合计超出 int64 范围: 已持仓 %d + 有效买单剩余 %d + 本次申请 %d 无法表示（最大持仓量 %d），整笔拒绝",
+						st.position, st.reservedBuy, qty, st.maxPosition)
+					e.appendReject(symbol, side, qty, limit, 0, r)
+					return 0, fmt.Errorf("%s %s 委托被拒绝: %w", side, symbol, ErrInt64Overflow)
+				}
+				if positionUsed > st.maxPosition {
+					reason = fmt.Sprintf("超过最大持仓量 %d: 已持仓 %d + 买单剩余 %d + 本次 %d",
+						st.maxPosition, st.position, st.reservedBuy, qty)
+				}
 			}
 		} else {
 			sellable := st.position - st.reservedSell
