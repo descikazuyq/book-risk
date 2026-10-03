@@ -779,10 +779,8 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 			e.appendAmountRejectLocked(symbol, qty, limit, r, nil, 0, false)
 			return 0, fmt.Errorf("%s %s 委托被拒绝: %w", side, symbol, ErrInt64Overflow)
 		}
-		unit := limit // 每笔买单占用按剩余数量 × max(限价, 最新报价)
-		if st.hasQuote && st.latest.Price > unit {
-			unit = st.latest.Price
-		}
+		// 与修改买单、账户金额汇总共用同一单价口径 buyReservedUnit。
+		unit := buyReservedUnit(st.hasQuote, st.latest.Price, limit)
 		need, ok := mulPosInt64(qty, unit)
 		var apply int64
 		if ok {
@@ -1183,11 +1181,12 @@ func (e *Engine) Modify(orderID, newQty, newLimit int64) error {
 
 	// 金额口径占用（剩余量 × max(限价, 最新已生效报价)）只在缺口规则与金额上限
 	// 需要时才试算：未启用金额上限且无缺口时，报价再高也不影响修改。
+	// 口径与接受新买单、账户金额汇总共用 buyReservedAmount/buyReservedUnit，统一维护。
 	var newAmtNeed, oldAmtNeed int64
 	needsComputed := false
 	computeNeeds := func() bool {
-		a, ok1 := amtNeed(st, newRemaining, newLimit)
-		b, ok2 := amtNeed(st, oldRemaining, oldLimit)
+		a, ok1 := buyReservedAmount(st, newRemaining, newLimit)
+		b, ok2 := buyReservedAmount(st, oldRemaining, oldLimit)
 		if !ok1 || !ok2 {
 			return false
 		}
@@ -1318,15 +1317,29 @@ func (e *Engine) Modify(orderID, newQty, newLimit int64) error {
 	return nil
 }
 
-// amtNeed 按金额上限口径计算一笔买单剩余量在当前最新已生效报价下的占用：
-// 剩余量 × max(限价, 报价)；无有效报价时按限价计（买单接受后必有报价，此为兜底）。
-// 乘积溢出 int64 时 ok 为 false。
-func amtNeed(st *symbolState, remaining, limit int64) (int64, bool) {
-	unit := limit
-	if st.hasQuote && st.latest.Price > unit {
-		unit = st.latest.Price
+// buyReservedUnit 是买单未成交部分“持仓金额占用”唯一的单价口径：
+//
+//	max(限价, 最新已生效报价)
+//
+// 接受新买单、修改买单与账户金额汇总都经此取值，保证“该用限价还是报价”这条
+// 业务规则只在此维护；无有效报价时按限价计（买单接受后必有报价，此为兜底）。
+// 它与现金占用单价（恒为限价）明确区分：报价高于限价时持仓金额占用按报价计，
+// 报价低于限价时仍按限价计。
+func buyReservedUnit(hasQuote bool, quotePrice, limit int64) int64 {
+	if hasQuote && quotePrice > limit {
+		return quotePrice
 	}
-	return mulPosInt64(remaining, unit)
+	return limit
+}
+
+// buyReservedAmount 是买单未成交部分持仓金额占用的完整口径：
+//
+//	剩余量 × buyReservedUnit(限价, 最新已生效报价)
+//
+// 修改买单在缺口规则与金额上限试算时使用；乘积溢出 int64 时 ok 为 false。
+// 调用时须持有引擎锁。
+func buyReservedAmount(st *symbolState, remaining, limit int64) (int64, bool) {
+	return mulPosInt64(remaining, buyReservedUnit(st.hasQuote, st.latest.Price, limit))
 }
 
 // appendModifyRejectLocked 追加修改拒绝记录；o 可能为 nil（订单不存在），
@@ -1874,11 +1887,9 @@ func (e *Engine) amountTotalsShadowLocked(quoteSym string, quote Quote, canceled
 			if rem <= 0 || !hasQuote {
 				continue // 买单接受时必有有效报价；无报价则不贡献占用
 			}
-			unit := o.Limit
-			if q.Price > unit {
-				unit = q.Price
-			}
-			need, ok := mulPosInt64(rem, unit)
+			// 单价口径与接受新买单、修改买单共用 buyReservedUnit（q 已按影子报价
+			// 覆盖，行情链预检因此与实际生效逐条一致）。
+			need, ok := mulPosInt64(rem, buyReservedUnit(hasQuote, q.Price, o.Limit))
 			if !ok {
 				return amtTotals{}, false
 			}
