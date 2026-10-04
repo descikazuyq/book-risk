@@ -1355,6 +1355,7 @@ func buyReservedAmount(st *symbolState, remaining, limit int64) (int64, bool) {
 // appendModifyRejectLocked 追加修改拒绝记录；o 可能为 nil（订单不存在），
 // 此时以 reqOrderID 固化调用方提交的订单编号。金额上限超额拒绝（withAmt）固化
 // 修改前合计、申请后合计与参与计算的报价定位；溢出或未启用金额上限时不带金额明细。
+// 金额快照与新买单拒绝共用 setAmountRejectSnapshot，保证两处口径一致维护。
 func (e *Engine) appendModifyRejectLocked(reqOrderID int64, o *Order, newQty, newLimit int64,
 	reason string, overflow, withAmt bool, before, apply amtTotals) {
 
@@ -1374,30 +1375,11 @@ func (e *Engine) appendModifyRejectLocked(reqOrderID int64, o *Order, newQty, ne
 		Reason:  reason,
 	}
 	if o != nil && e.amtLimitSet && (overflow || withAmt) {
-		r.AmtEnabled = true
-		r.AmtLimit = e.amtLimit
 		if withAmt {
-			r.AmtHolding = before.holding
-			r.AmtBuyReserved = before.reserved
-			r.AmtTotal = before.total
-			r.AmtApplyTotal = apply.total
-			refs := append([]RiskQuoteRef(nil), before.refs...)
-			if st := e.symbols[symbol]; st != nil && st.hasQuote {
-				found := false
-				for _, rf := range refs {
-					if rf.Symbol == symbol {
-						found = true
-						break
-					}
-				}
-				if !found {
-					refs = append(refs, RiskQuoteRef{
-						Symbol: symbol, Seq: st.latest.Seq, Moment: st.latest.Moment, Price: st.latest.Price,
-					})
-					sort.Slice(refs, func(i, j int) bool { return refs[i].Symbol < refs[j].Symbol })
-				}
-			}
-			r.AmtQuoteRefs = refs
+			e.setAmountRejectSnapshot(&r, &before, apply.total, true)
+		} else {
+			// 修改中的越界拒绝只固化启用状态与上限，不带金额明细与参与报价。
+			e.setAmountRejectSnapshot(&r, nil, 0, false)
 		}
 	}
 	e.appendRecord(r, e.symbols[symbol])
@@ -1415,48 +1397,70 @@ func (e *Engine) appendReject(symbol string, side Side, qty, limit, orderID int6
 	}, e.symbols[symbol])
 }
 
-// appendAmountRejectLocked 追加因账户总持仓金额上限产生的拒绝记录，固化判断时的
-// 两类金额、上限；withApply 为 true 时同时保存申请后合计与参与计算的报价定位。
-// t 为 nil 表示金额计算本身溢出，此时只固化启用状态与上限。
+// appendAmountRejectLocked 追加因账户总持仓金额上限产生的新买单拒绝记录。
+// 金额快照与修改买单拒绝共用 setAmountRejectSnapshot：t 为 nil 表示申请前汇总
+// 本身溢出，只固化启用状态与上限；否则固化申请前金额与参与报价，withApply 为
+// true 时同时保存申请后合计。
 func (e *Engine) appendAmountRejectLocked(symbol string, qty, limit int64, reason string,
 	t *amtTotals, applyTotal int64, withApply bool) {
 	r := Record{
-		Kind:       RecordRejected,
-		Symbol:     symbol,
-		Side:       Buy,
-		Qty:        qty,
-		Limit:      limit,
-		Reason:     reason,
-		AmtEnabled: true,
-		AmtLimit:   e.amtLimit,
+		Kind:   RecordRejected,
+		Symbol: symbol,
+		Side:   Buy,
+		Qty:    qty,
+		Limit:  limit,
+		Reason: reason,
 	}
-	if t != nil {
-		r.AmtHolding = t.holding
-		r.AmtBuyReserved = t.reserved
-		r.AmtTotal = t.total
-		if withApply {
-			r.AmtApplyTotal = applyTotal
-		}
-		refs := append([]RiskQuoteRef(nil), t.refs...)
-		// 申请合约的报价也参与了申请后合计（max(限价, 报价)），须一并留存。
-		if st := e.symbols[symbol]; st != nil && st.hasQuote {
-			found := false
-			for _, rf := range refs {
-				if rf.Symbol == symbol {
-					found = true
-					break
-				}
-			}
-			if !found {
-				refs = append(refs, RiskQuoteRef{
-					Symbol: symbol, Seq: st.latest.Seq, Moment: st.latest.Moment, Price: st.latest.Price,
-				})
-				sort.Slice(refs, func(i, j int) bool { return refs[i].Symbol < refs[j].Symbol })
-			}
-		}
-		r.AmtQuoteRefs = refs
-	}
+	e.setAmountRejectSnapshot(&r, t, applyTotal, withApply)
 	e.appendRecord(r, e.symbols[symbol])
+}
+
+// setAmountRejectSnapshot 在金额上限拒绝记录上固化判断快照，是新买单（Buy）与
+// 修改买单（Modify）拒绝记录共用的唯一口径，保证金额含义、报价来源与历史保留
+// 规则只在此维护：
+//   - 启用状态与判断时的上限总是固化；
+//   - t 非 nil 时固化申请前的两类金额、合计与参与计算的各合约报价定位
+//     （含申请合约自身的报价，即使它此前没有持仓或有效买单）；
+//   - withApply 为 true 时再固化申请后合计；
+//   - t 为 nil 表示金额计算本身溢出 int64，只保留启用状态与上限。
+//
+// 固化的全部是值副本，后续报价、调限额、成功修改或调用方改动 Records 返回的
+// 内容都不会改写已有记录。
+func (e *Engine) setAmountRejectSnapshot(r *Record, t *amtTotals, applyTotal int64, withApply bool) {
+	r.AmtEnabled = true
+	r.AmtLimit = e.amtLimit
+	if t == nil {
+		return
+	}
+	r.AmtHolding = t.holding
+	r.AmtBuyReserved = t.reserved
+	r.AmtTotal = t.total
+	if withApply {
+		r.AmtApplyTotal = applyTotal
+	}
+	r.AmtQuoteRefs = e.amountQuoteRefsWith(t.refs, r.Symbol)
+}
+
+// amountQuoteRefsWith 以参与金额计算的各合约报价定位为基础，补上申请合约 symbol
+// 的最新已生效报价（此前没有持仓或有效买单、因而不在 refs 中时），按合约代码
+// 排列后返回；每个合约只出现一次。等待补齐的报价不是已生效报价，不进入快照。
+// 返回的是新切片，调用方与引擎内部状态后续的变化都不影响已固化的记录。
+func (e *Engine) amountQuoteRefsWith(refs []RiskQuoteRef, symbol string) []RiskQuoteRef {
+	out := append([]RiskQuoteRef(nil), refs...)
+	st := e.symbols[symbol]
+	if st == nil || !st.hasQuote {
+		return out
+	}
+	for _, rf := range out {
+		if rf.Symbol == symbol {
+			return out
+		}
+	}
+	out = append(out, RiskQuoteRef{
+		Symbol: symbol, Seq: st.latest.Seq, Moment: st.latest.Moment, Price: st.latest.Price,
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Symbol < out[j].Symbol })
+	return out
 }
 
 // appendRecord 在事件记录上固化当时的报价与持仓限额快照。
