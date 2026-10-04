@@ -696,7 +696,13 @@ func (e *Engine) Buy(symbol string, qty, limit int64) (int64, error) {
 	return e.placeOrder(symbol, Buy, qty, limit)
 }
 
-// Sell 提交卖单：占用可卖持仓。
+// Sell 提交卖单：占用可卖持仓。接受后仍是普通待成交卖单：保留提交的总量与
+// 限价，占用相应的可卖数量，不预先增加现金、扣减持仓，也不改变任何买单的现金
+// 占用。卖单能否接受只取决于合约已有有效报价与持仓限额设置、数量与限价合法且
+// 可卖数量充足；整笔“限价 × 委托总量”从不预占用现金或预先结算，因此即使该
+// 乘积无法用 int64 表示也不拒绝（卖单可逐笔分次成交），这与把一笔有效卖单
+// 修改到相同参数的口径一致。实际成交仍逐笔按回报的数量与价格结算：单笔成交
+// 金额本身或其加回现金后的合计超出 int64 时，该笔成交被拒绝（见 Fill）。
 func (e *Engine) Sell(symbol string, qty, limit int64) (int64, error) {
 	return e.placeOrder(symbol, Sell, qty, limit)
 }
@@ -733,20 +739,24 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 		reason = fmt.Sprintf("合约 %s 报价存在缺口（最新序号 %d，等待序号 %d），拒绝新买单",
 			symbol, st.latest.Seq, st.latest.Seq+1)
 	}
-	if reason == "" {
+	if reason == "" && side == Buy {
+		// 买单按整笔限价金额占用现金：限价 × 委托总量必须可用 int64 表示。
 		cost, ok := mulPositive(limit, qty)
 		if !ok {
 			reason = fmt.Sprintf("限价 %d × 数量 %d 超出整数范围", limit, qty)
-		} else if side == Buy {
-			if cost > e.cash-e.reservedCash {
-				reason = fmt.Sprintf("现金不足: 需要 %d，可用 %d", cost, e.cash-e.reservedCash)
-			}
-		} else {
-			sellable := st.position - st.reservedSell
-			if qty > sellable {
-				reason = fmt.Sprintf("可卖数量不足: 需要 %d，可卖 %d（持仓 %d，卖单占用 %d）",
-					qty, sellable, st.position, st.reservedSell)
-			}
+		} else if cost > e.cash-e.reservedCash {
+			reason = fmt.Sprintf("现金不足: 需要 %d，可用 %d", cost, e.cash-e.reservedCash)
+		}
+	}
+	if reason == "" && side == Sell {
+		// 卖单接受与否只取决于可卖持仓：整笔“限价 × 委托总量”不预占用现金、也不
+		// 预先结算，因此该乘积无法用 int64 表示本身不构成拒绝理由（卖单可逐笔分次
+		// 成交，每笔成交再按实际数量与价格做可表示性检查）。这与把有效卖单修改到
+		// 相同参数的口径保持一致。
+		sellable := st.position - st.reservedSell
+		if qty > sellable {
+			reason = fmt.Sprintf("可卖数量不足: 需要 %d，可卖 %d（持仓 %d，卖单占用 %d）",
+				qty, sellable, st.position, st.reservedSell)
 		}
 	}
 
@@ -898,7 +908,7 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 
 	o := e.orders[t.OrderID]
 	st := e.symbols[o.Symbol]
-	amount, _ := mulPositive(t.Price, t.Qty) // 接受委托时已校验过可乘性，此处必然安全
+	amount, _ := mulPositive(t.Price, t.Qty) // validateFill 已校验单笔成交金额可乘，此处必然安全
 
 	// 卖出成交的现金结算必须始终可表示：卖出所得加回现金余额后超出 int64 范围时
 	// 整笔拒绝，不依赖日内亏损保护是否开启，也不以设置账户总持仓金额上限为前提。
