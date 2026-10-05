@@ -1512,25 +1512,53 @@ func mulPositive(a, b int64) (int64, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// 日内亏损保护
+// 统一持仓估值
 //
-// 净值口径：现金余额 + 各合约持仓按最新已生效报价计算的市值。
-// 未成交买单占用的现金是现金余额的一部分（占用只是冻结，并未扣除），因此不重复扣减；
-// 跨号等待的报价不是“已生效报价”，不参与估值；无有效报价的持仓同样不计市值。
+// 日内亏损保护与账户总持仓金额上限共用同一套持仓估值规则，只在 evaluateLocked
+// 维护一次：遍历按合约代码排列的各合约，取其最新已生效（或假设即将生效）报价，
+// 持仓市值 = 数量 × 报价；卖单占用的数量成交前仍属于持仓，不提前抵减；等待补齐
+// 的报价不参与；无持仓的合约不贡献持仓市值。账户金额上限额外通过 withBuys 计入
+// 有效买单剩余量 × max(限价, 报价)，这一部分不进入日内净值。
 // ---------------------------------------------------------------------------
 
-// valuationLocked 按当前状态试算净值与日内亏损。
-func (e *Engine) valuationLocked() (RiskValuation, []RiskQuoteRef, bool) {
-	return e.valuationHypoLocked(e.cash, "", 0, false, Quote{}, false)
+// positionValuation 是统一持仓估值核心对单个合约的试算结果，只包含真正以一条
+// 已生效（或假设即将生效）报价参与了本次计算的合约。
+type positionValuation struct {
+	ref            RiskQuoteRef
+	hasHolding     bool // 持仓数量 × 报价 计入了持仓市值
+	hasBuyReserved bool // 有效买单剩余量 × max(限价, 报价) 计入了买单占用
 }
 
-// valuationHypoLocked 在假设状态上试算：可覆盖现金、某合约持仓与某合约报价，
-// 供成交后、报价逐条生效前在不改业务状态的前提下做溢出与触线检查。
-func (e *Engine) valuationHypoLocked(cash int64, hypoSym string, hypoPos int64, usePos bool,
-	hypoQuote Quote, useQuote bool) (RiskValuation, []RiskQuoteRef, bool) {
+// valuationSummary 是统一持仓估值核心一次试算的汇总。
+type valuationSummary struct {
+	holding  int64 // Σ 持仓数量 × 最新已生效报价
+	reserved int64 // Σ 有效买单剩余量 × max(限价, 报价)；withBuys 为 false 时恒为 0
+	total    int64 // holding + reserved；仅 withBuys 为 true 时计算
+	symbols  []positionValuation
+}
 
-	equity := cash
-	var refs []RiskQuoteRef
+// evaluateLocked 是日内亏损保护与账户总持仓金额上限共用的唯一持仓估值规则：
+//
+//	已持仓市值：各合约持仓数量 × 最新已生效报价；
+//	买单占用（withBuys 时）：各有效买单剩余量 × max(限价, 最新已生效报价)。
+//
+// 合约按代码排列逐条累加；卖单占用的数量在成交前仍属于持仓，不提前抵减；
+// 等待补齐的报价不是已生效报价，不参与估值；持仓为零的合约不贡献持仓市值，
+// 也不会仅凭买单进入“仅解释净值”的持仓报价定位。任一乘积或合计溢出 int64
+// 时 ok 为 false。
+//
+// 影子参数仅供“变更生效前的判断”使用，绝不改动引擎状态：
+//   - usePos 且合约为 hypoSym 时，以 hypoPos 代替该合约当前持仓（成交后判断）；
+//   - useQuote 且合约为 hypoSym 时，以 hypoQuote 强制作为该合约的最新报价
+//     （报价逐条生效前的判断）；
+//   - withBuys 控制是否计算有效买单占用：账户金额上限需要，日内净值不需要
+//     （买单冻结的现金本就留在现金余额中，不能再从净值扣除；不计算也保证高价
+//     报价导致的买单占用溢出不会误伤净值试算）；
+//   - canceled 中的买单按已撤销处理（报价链预检时模拟本批此前各条报价的撤单）。
+func (e *Engine) evaluateLocked(hypoSym string, hypoPos int64, usePos bool,
+	hypoQuote Quote, useQuote, withBuys bool, canceled map[int64]bool) (valuationSummary, bool) {
+
+	var out valuationSummary
 
 	syms := make([]string, 0, len(e.symbols))
 	for s := range e.symbols {
@@ -1540,38 +1568,129 @@ func (e *Engine) valuationHypoLocked(cash int64, hypoSym string, hypoPos int64, 
 
 	for _, s := range syms {
 		st := e.symbols[s]
+
 		pos := st.position
 		if usePos && s == hypoSym {
 			pos = hypoPos
 		}
-		if pos == 0 {
-			continue // 空仓合约不参与估值，也无需留存报价
-		}
+
 		hasQuote := st.hasQuote
 		q := st.latest
 		if useQuote && s == hypoSym {
 			hasQuote = true
 			q = hypoQuote
 		}
-		if !hasQuote {
-			continue // 无已生效报价：该持仓暂不计市值
+
+		var pv positionValuation
+		contributed := false
+
+		// 已持仓金额：持仓数量 × 最新已生效报价。卖单占用的持仓在成交前不抵减；
+		// 空仓或无有效报价的合约不贡献市值，也不进入报价定位。
+		if pos != 0 && hasQuote {
+			marketValue, ok := mulPosInt64(pos, q.Price)
+			if !ok {
+				return valuationSummary{}, false
+			}
+			out.holding, ok = addInt64(out.holding, marketValue)
+			if !ok {
+				return valuationSummary{}, false
+			}
+			pv.hasHolding = true
+			contributed = true
 		}
-		marketValue, ok := mulPosInt64(pos, q.Price)
-		if !ok {
-			return RiskValuation{}, nil, false
+
+		if withBuys {
+			// 买单剩余量占用：Σ 剩余量 × max(限价, 最新报价)。
+			// canceled 中的订单按已撤销处理；无有效报价时买单不贡献占用。
+			var symReserved int64
+			for _, id := range st.buyOrderIDs {
+				if canceled != nil && canceled[id] {
+					continue
+				}
+				o := e.orders[id]
+				if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
+					continue
+				}
+				rem := o.Remaining()
+				if rem <= 0 || !hasQuote {
+					continue
+				}
+				// 单价口径与接受新买单、修改买单共用 buyReservedUnit（q 已按影子
+				// 报价覆盖，行情链预检因此与实际生效逐条一致）。
+				need, ok := mulPosInt64(rem, buyReservedUnit(hasQuote, q.Price, o.Limit))
+				if !ok {
+					return valuationSummary{}, false
+				}
+				symReserved, ok = addInt64(symReserved, need)
+				if !ok {
+					return valuationSummary{}, false
+				}
+				pv.hasBuyReserved = true
+				contributed = true
+			}
+			var ok bool
+			out.reserved, ok = addInt64(out.reserved, symReserved)
+			if !ok {
+				return valuationSummary{}, false
+			}
 		}
-		equity, ok = addInt64(equity, marketValue)
-		if !ok {
-			return RiskValuation{}, nil, false
+
+		if contributed {
+			pv.ref = RiskQuoteRef{Symbol: s, Seq: q.Seq, Moment: q.Moment, Price: q.Price}
+			out.symbols = append(out.symbols, pv)
 		}
-		refs = append(refs, RiskQuoteRef{Symbol: s, Seq: q.Seq, Moment: q.Moment, Price: q.Price})
 	}
 
+	if withBuys {
+		total, ok := addInt64(out.holding, out.reserved)
+		if !ok {
+			return valuationSummary{}, false
+		}
+		out.total = total
+	}
+	return out, true
+}
+
+// holdingRefs 从统一估值结果中取出“真正贡献持仓市值”的合约报价定位：
+// 同一合约同时有持仓和买单时只出现一次；只有买单的合约不进入净值持仓定位。
+func holdingRefs(sum valuationSummary) []RiskQuoteRef {
+	var refs []RiskQuoteRef
+	for _, pv := range sum.symbols {
+		if pv.hasHolding {
+			refs = append(refs, pv.ref)
+		}
+	}
+	return refs
+}
+
+// valuationLocked 按当前状态试算净值与日内亏损。
+//
+// 净值口径：现金余额 + 各合约持仓按最新已生效报价计算的市值。未成交买单占用的
+// 现金是现金余额的一部分（占用只是冻结，并未扣除），因此不重复扣减；跨号等待中
+// 的报价不是“已生效报价”，不参与估值；无有效报价的持仓同样不计市值。
+func (e *Engine) valuationLocked() (RiskValuation, []RiskQuoteRef, bool) {
+	return e.valuationHypoLocked(e.cash, "", 0, false, Quote{}, false)
+}
+
+// valuationHypoLocked 在假设状态上试算：可覆盖现金、某合约持仓与某合约报价，
+// 供成交后、报价逐条生效前在不改业务状态的前提下做溢出与触线检查。
+// 持仓估值规则统一走 evaluateLocked（不计算买单占用）。
+func (e *Engine) valuationHypoLocked(cash int64, hypoSym string, hypoPos int64, usePos bool,
+	hypoQuote Quote, useQuote bool) (RiskValuation, []RiskQuoteRef, bool) {
+
+	sum, ok := e.evaluateLocked(hypoSym, hypoPos, usePos, hypoQuote, useQuote, false, nil)
+	if !ok {
+		return RiskValuation{}, nil, false
+	}
+	equity, ok := addInt64(cash, sum.holding)
+	if !ok {
+		return RiskValuation{}, nil, false
+	}
 	loss, ok := subLoss(e.riskBaseline, equity)
 	if !ok {
 		return RiskValuation{}, nil, false
 	}
-	return RiskValuation{Equity: equity, Loss: loss}, refs, true
+	return RiskValuation{Equity: equity, Loss: loss}, holdingRefs(sum), true
 }
 
 // subLoss 返回基准净值减当前净值；浮盈（差值为负）记零。差值溢出时 ok 为 false。
@@ -1621,6 +1740,10 @@ func mulPosInt64(a, b int64) (int64, bool) {
 	}
 	return a * b, true
 }
+
+// ---------------------------------------------------------------------------
+// 日内亏损保护（持仓估值规则见上方“统一持仓估值”）
+// ---------------------------------------------------------------------------
 
 // triggerRiskLocked 首次触线处理：记录触线事件并按订单编号从大到小撤销全部有效买单。
 // 调用前须确认 riskOpen 且当前尚未限制；val/refs 为引发触线的那次试算结果
@@ -1861,82 +1984,24 @@ func (e *Engine) amountTotalsLocked() (amtTotals, bool) {
 // amountTotalsShadowLocked 在影子状态上试算：
 // quoteSym 非空时以 quote 作为该合约的最新已生效报价（报价链预检）；
 // canceled 中的订单编号视为已撤销，不贡献买单占用。
+// 持仓市值、买单占用与报价定位规则统一走 evaluateLocked，本函数只做结构转换。
 func (e *Engine) amountTotalsShadowLocked(quoteSym string, quote Quote, canceled map[int64]bool) (amtTotals, bool) {
-	var out amtTotals
-
-	syms := make([]string, 0, len(e.symbols))
-	for s := range e.symbols {
-		syms = append(syms, s)
-	}
-	sort.Strings(syms)
-
-	for _, s := range syms {
-		st := e.symbols[s]
-
-		hasQuote := st.hasQuote
-		q := st.latest
-		if s == quoteSym {
-			hasQuote = true
-			q = quote
-		}
-
-		contributed := false
-
-		// 已持仓金额：持仓数量 × 最新已生效报价。卖单占用的持仓不抵减。
-		if st.position != 0 && hasQuote {
-			marketValue, ok := mulPosInt64(st.position, q.Price)
-			if !ok {
-				return amtTotals{}, false
-			}
-			out.holding, ok = addInt64(out.holding, marketValue)
-			if !ok {
-				return amtTotals{}, false
-			}
-			contributed = true
-		}
-
-		// 买单剩余量占用：Σ 剩余量 × max(限价, 最新报价)。
-		var symReserved int64
-		for _, id := range st.buyOrderIDs {
-			if canceled != nil && canceled[id] {
-				continue
-			}
-			o := e.orders[id]
-			if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
-				continue
-			}
-			rem := o.Remaining()
-			if rem <= 0 || !hasQuote {
-				continue // 买单接受时必有有效报价；无报价则不贡献占用
-			}
-			// 单价口径与接受新买单、修改买单共用 buyReservedUnit（q 已按影子报价
-			// 覆盖，行情链预检因此与实际生效逐条一致）。
-			need, ok := mulPosInt64(rem, buyReservedUnit(hasQuote, q.Price, o.Limit))
-			if !ok {
-				return amtTotals{}, false
-			}
-			symReserved, ok = addInt64(symReserved, need)
-			if !ok {
-				return amtTotals{}, false
-			}
-			contributed = true
-		}
-		var ok bool
-		out.reserved, ok = addInt64(out.reserved, symReserved)
-		if !ok {
-			return amtTotals{}, false
-		}
-
-		if contributed {
-			out.refs = append(out.refs, RiskQuoteRef{Symbol: s, Seq: q.Seq, Moment: q.Moment, Price: q.Price})
-		}
-	}
-
-	total, ok := addInt64(out.holding, out.reserved)
+	sum, ok := e.evaluateLocked(quoteSym, 0, false, quote, true, true, canceled)
 	if !ok {
 		return amtTotals{}, false
 	}
-	out.total = total
+	out := amtTotals{
+		holding:  sum.holding,
+		reserved: sum.reserved,
+		total:    sum.total,
+	}
+	// 金额定位包含“贡献了持仓市值或买单占用”的合约；同一合约同时有持仓和
+	// 买单时只出现一次（evaluateLocked 已按合约归并并按代码排序）。
+	for _, pv := range sum.symbols {
+		if pv.hasHolding || pv.hasBuyReserved {
+			out.refs = append(out.refs, pv.ref)
+		}
+	}
 	return out, true
 }
 
