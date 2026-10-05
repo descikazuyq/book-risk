@@ -913,44 +913,35 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	st := e.symbols[o.Symbol]
 	amount, _ := mulPositive(t.Price, t.Qty) // validateFill 已校验单笔成交金额可乘，此处必然安全
 
+	// 统一结算规则：成交前的卖出 cash 检查、风险净值试算与成交后的实际记账
+	// 共用同一套现金/持仓结算（见 settleFillLocked），同一笔成交不会在检查与
+	// 入账两个时点套用不同口径。
+	settleCash, settlePos, cashOK, posOK := e.settleFillLocked(o, st, amount, t.Qty)
+
 	// 卖出成交的现金结算必须始终可表示：卖出所得加回现金余额后超出 int64 范围时
 	// 整笔拒绝，不依赖日内亏损保护是否开启，也不以设置账户总持仓金额上限为前提。
 	// 除一条拒绝记录外不改变任何业务状态（成交编号不被占用，持仓与卖单占用保留）。
-	if o.Side == Sell {
-		if _, ok := addInt64(e.cash, amount); !ok {
-			e.appendRecord(Record{
-				Kind:       RecordRejected,
-				Symbol:     o.Symbol,
-				Side:       o.Side,
-				OrderID:    o.ID,
-				TradeID:    t.TradeID,
-				Qty:        t.Qty,
-				TradePrice: t.Price,
-				Reason: fmt.Sprintf("卖出所得 %d 加入现金余额 %d 后超出 int64 范围，整笔拒绝",
-					amount, e.cash),
-			}, st)
-			return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
-		}
+	if o.Side == Sell && !cashOK {
+		e.appendRecord(Record{
+			Kind:       RecordRejected,
+			Symbol:     o.Symbol,
+			Side:       o.Side,
+			OrderID:    o.ID,
+			TradeID:    t.TradeID,
+			Qty:        t.Qty,
+			TradePrice: t.Price,
+			Reason: fmt.Sprintf("卖出所得 %d 加入现金余额 %d 后超出 int64 范围，整笔拒绝",
+				amount, e.cash),
+		}, st)
+		return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
 	}
 
 	// 启用风险保护时：先在假设成交后的状态上试算净值。越界则整笔拒绝，
 	// 除拒绝记录外不改变任何业务状态（成交编号也不被占用）。
 	if e.riskOpen {
-		var hypoCash, hypoPos int64
-		arithOK := true
-		if o.Side == Buy {
-			hypoCash, arithOK = subInt64(e.cash, amount) // 成交金额不超过买单占用，余额不会为负
-			if arithOK {
-				hypoPos, arithOK = addInt64(st.position, t.Qty)
-			}
-		} else {
-			hypoCash, arithOK = addInt64(e.cash, amount) // 上方已预检，此处必然安全
-			if arithOK {
-				hypoPos, arithOK = subInt64(st.position, t.Qty) // 可卖校验保证持仓足量
-			}
-		}
+		arithOK := cashOK && posOK
 		if arithOK {
-			if _, _, ok := e.valuationHypoLocked(hypoCash, o.Symbol, hypoPos, true, Quote{}, false); !ok {
+			if _, _, ok := e.valuationHypoLocked(settleCash, o.Symbol, settlePos, true, Quote{}, false); !ok {
 				arithOK = false
 			}
 		}
@@ -969,17 +960,17 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 		}
 	}
 
+	// 实际入账：沿用上方同一结算结果，不重新计算。买入释放本次成交部分的
+	// 限价占用（价差立即释放），未成交部分继续占用；卖出减少持仓与卖单占用，
+	// 不提前处理未成交部分。
 	if o.Side == Buy {
-		// 释放限价占用，按实际成交金额扣现金；价差立即释放。
 		e.reservedCash -= o.Limit * t.Qty
-		e.cash -= amount
-		st.position += t.Qty
 		st.reservedBuy -= t.Qty
 	} else {
-		e.cash += amount
-		st.position -= t.Qty
 		st.reservedSell -= t.Qty
 	}
+	e.cash = settleCash
+	st.position = settlePos
 	o.Filled += t.Qty
 	if o.Filled == o.Qty {
 		o.Status = StatusFilled
@@ -1020,6 +1011,28 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 		}
 	}
 	return res, nil
+}
+
+// settleFillLocked 是一笔成交现金/持仓结算的唯一规则：按本次成交价 × 成交量
+// 试算入账后的现金余额与合约持仓，本身不改任何业务状态。
+//
+//   - 买入：现金只扣本次成交金额（amount），持仓增加本次成交量；
+//   - 卖出：本次所得加入现金，持仓减少本次成交量。
+//
+// amount 必须为 成交价 × 成交量（调用前已校验可乘）。cashOK/posOK 分别报告现金
+// 与持仓结算是否超出 int64 范围，越界时对应结果为零值。买单的现金占用释放与
+// 卖单的持仓占用释放不属于本规则：它们只跟随成交数量按订单方向各自维护。
+// 成交前的卖出 cash 检查、风险净值试算与成交后的实际记账都经此计算，
+// 保证同一笔成交在两个时点沿用同一套结算规则。调用时须持有引擎锁。
+func (e *Engine) settleFillLocked(o *Order, st *symbolState, amount, qty int64) (cash, pos int64, cashOK, posOK bool) {
+	if o.Side == Buy {
+		cash, cashOK = subInt64(e.cash, amount) // 成交金额不超过买单占用，余额不会为负
+		pos, posOK = addInt64(st.position, qty)
+	} else {
+		cash, cashOK = addInt64(e.cash, amount)
+		pos, posOK = subInt64(st.position, qty) // 可卖校验保证持仓足量
+	}
+	return cash, pos, cashOK, posOK
 }
 
 func (e *Engine) validateFill(t Trade) string {
