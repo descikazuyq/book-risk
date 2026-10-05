@@ -302,7 +302,9 @@ type Record struct {
 	OldFilled int64
 }
 
-// RiskQuoteRef 是触线净值计算所用的某个持仓合约最新报价定位。
+// RiskQuoteRef 是一次持仓估值中真正参与计算的某个合约的最新报价定位
+// （序号、时刻与价格）；日内亏损净值与账户总持仓金额合计共用同一估值规则，
+// 故两类记录都用它固化当时的报价事实。
 type RiskQuoteRef struct {
 	Symbol string
 	Seq    int64
@@ -1512,25 +1514,57 @@ func mulPositive(a, b int64) (int64, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// 日内亏损保护
+// 共用持仓估值（日内亏损保护与账户总持仓金额上限）
 //
-// 净值口径：现金余额 + 各合约持仓按最新已生效报价计算的市值。
-// 未成交买单占用的现金是现金余额的一部分（占用只是冻结，并未扣除），因此不重复扣减；
-// 跨号等待的报价不是“已生效报价”，不参与估值；无有效报价的持仓同样不计市值。
+// 两项保护共用同一条持仓估值规则，只在此维护：
+//   - 持仓市值始终为“持仓数量 × 最新已生效报价”；等待补齐的报价不是已生效报价，
+//     不能提前参与；卖单占用的数量在成交前仍属于持仓，不提前抵减；
+//   - 没有持仓的合约不贡献持仓市值，也不进入仅用于解释净值的持仓报价定位；
+//   - 报价定位按合约代码排列，同一合约在一次计算中只出现一次，固化当时真正
+//     参与计算的合约、序号、时刻与价格。
+//
+// 两项保护的差异只发生在估值核心之外：
+//   - 日内亏损净值 = 现金余额 + 持仓市值。未成交买单冻结的现金仍是现金余额的一部分
+//     （占用只是冻结，并未扣除），不重复扣减，买单剩余量也不按限价另计占用；
+//   - 账户总持仓金额合计 = 持仓市值 + 有效买单剩余量 × max(限价, 最新报价)，
+//     买单占用只属于金额上限口径，绝不带进净值。
 // ---------------------------------------------------------------------------
 
-// valuationLocked 按当前状态试算净值与日内亏损。
-func (e *Engine) valuationLocked() (RiskValuation, []RiskQuoteRef, bool) {
-	return e.valuationHypoLocked(e.cash, "", 0, false, Quote{}, false)
+// valuationScope 描述一次持仓估值所用的状态；零值即按当前实际状态估值。
+// 风险侧试算可覆盖现金、某合约的持仓与/或报价（报价生效前、成交入账前的判断与
+// 实际查询使用同一估值规则，但尚未接受的改动不会写回现金、持仓或当前报价）；
+// 金额侧的报价链预检通过 quoteSym/quote 与 canceled 表达假设状态。
+type valuationScope struct {
+	cash     int64 // 估值起点现金（风险净值口径使用）
+	hypoSym  string
+	hypoPos  int64
+	usePos   bool
+	quoteSym string
+	quote    Quote
+	useQuote bool
+
+	// withOrders 为 true 时额外计入有效买单剩余量占用（仅账户金额上限口径）：
+	// 每笔剩余买单按 剩余量 × max(限价, 最新报价) 计；canceled 中的编号视为已撤销。
+	// 风险净值口径恒为 false——买单冻结的现金属于现金余额，不能从净值再次扣除。
+	withOrders bool
+	canceled   map[int64]bool
 }
 
-// valuationHypoLocked 在假设状态上试算：可覆盖现金、某合约持仓与某合约报价，
-// 供成交后、报价逐条生效前在不改业务状态的前提下做溢出与触线检查。
-func (e *Engine) valuationHypoLocked(cash int64, hypoSym string, hypoPos int64, usePos bool,
-	hypoQuote Quote, useQuote bool) (RiskValuation, []RiskQuoteRef, bool) {
+// positionValuation 是一次持仓估值的结果。holding 为各合约持仓市值之和；
+// reserved 为有效买单剩余量占用之和（仅 scope.withOrders 时非零）；refs 为真正
+// 参与本次计算的合约报价定位，按合约代码排列、每合约一条。
+type positionValuation struct {
+	holding  int64
+	reserved int64
+	refs     []RiskQuoteRef
+}
 
-	equity := cash
-	var refs []RiskQuoteRef
+// positionValuationLocked 是两项保护共用的唯一持仓估值入口：负责逐合约选择最新
+// 已生效报价（含假设覆盖）、计算持仓市值、可选计入有效买单剩余量占用、排列报价
+// 定位，并对每个乘积与合计做 int64 溢出检查；任一步溢出时 ok 为 false。
+// 调用时须持有引擎锁。
+func (e *Engine) positionValuationLocked(scope valuationScope) (positionValuation, bool) {
+	var out positionValuation
 
 	syms := make([]string, 0, len(e.symbols))
 	for s := range e.symbols {
@@ -1540,38 +1574,113 @@ func (e *Engine) valuationHypoLocked(cash int64, hypoSym string, hypoPos int64, 
 
 	for _, s := range syms {
 		st := e.symbols[s]
+
 		pos := st.position
-		if usePos && s == hypoSym {
-			pos = hypoPos
+		if scope.usePos && s == scope.hypoSym {
+			pos = scope.hypoPos
 		}
-		if pos == 0 {
-			continue // 空仓合约不参与估值，也无需留存报价
-		}
+
 		hasQuote := st.hasQuote
 		q := st.latest
-		if useQuote && s == hypoSym {
+		if scope.useQuote && s == scope.quoteSym {
 			hasQuote = true
-			q = hypoQuote
+			q = scope.quote
 		}
-		if !hasQuote {
-			continue // 无已生效报价：该持仓暂不计市值
-		}
-		marketValue, ok := mulPosInt64(pos, q.Price)
-		if !ok {
-			return RiskValuation{}, nil, false
-		}
-		equity, ok = addInt64(equity, marketValue)
-		if !ok {
-			return RiskValuation{}, nil, false
-		}
-		refs = append(refs, RiskQuoteRef{Symbol: s, Seq: q.Seq, Moment: q.Moment, Price: q.Price})
-	}
 
+		contributed := false
+
+		// 持仓市值：持仓数量 × 最新已生效报价。卖单占用的持仓不抵减；
+		// 无持仓或无已生效报价的合约不贡献市值，也不进入报价定位。
+		if pos != 0 && hasQuote {
+			marketValue, ok := mulPosInt64(pos, q.Price)
+			if !ok {
+				return positionValuation{}, false
+			}
+			out.holding, ok = addInt64(out.holding, marketValue)
+			if !ok {
+				return positionValuation{}, false
+			}
+			contributed = true
+		}
+
+		// 有效买单剩余量占用（仅账户金额上限口径）：
+		// Σ 剩余量 × buyReservedUnit(限价, 最新已生效报价)。同一合约同时有持仓和
+		// 买单时只贡献一次报价定位；只有有效买单的合约进入金额定位，但不会进入
+		// 日内净值的持仓报价定位（风险口径 withOrders=false）。
+		if scope.withOrders && hasQuote {
+			var symReserved int64
+			for _, id := range st.buyOrderIDs {
+				if scope.canceled != nil && scope.canceled[id] {
+					continue
+				}
+				o := e.orders[id]
+				if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
+					continue
+				}
+				rem := o.Remaining()
+				if rem <= 0 {
+					continue
+				}
+				need, ok := mulPosInt64(rem, buyReservedUnit(hasQuote, q.Price, o.Limit))
+				if !ok {
+					return positionValuation{}, false
+				}
+				symReserved, ok = addInt64(symReserved, need)
+				if !ok {
+					return positionValuation{}, false
+				}
+				contributed = true
+			}
+			var ok bool
+			out.reserved, ok = addInt64(out.reserved, symReserved)
+			if !ok {
+				return positionValuation{}, false
+			}
+		}
+
+		if contributed {
+			out.refs = append(out.refs, RiskQuoteRef{Symbol: s, Seq: q.Seq, Moment: q.Moment, Price: q.Price})
+		}
+	}
+	return out, true
+}
+
+// valuationLocked 按当前状态试算净值与日内亏损。
+func (e *Engine) valuationLocked() (RiskValuation, []RiskQuoteRef, bool) {
+	return e.valuationWithLocked(valuationScope{cash: e.cash})
+}
+
+// valuationHypoLocked 在假设状态上试算：可覆盖现金、某合约持仓与某合约报价，
+// 供成交后、报价逐条生效前在不改业务状态的前提下做溢出与触线检查。
+func (e *Engine) valuationHypoLocked(cash int64, hypoSym string, hypoPos int64, usePos bool,
+	hypoQuote Quote, useQuote bool) (RiskValuation, []RiskQuoteRef, bool) {
+	return e.valuationWithLocked(valuationScope{
+		cash:     cash,
+		hypoSym:  hypoSym,
+		hypoPos:  hypoPos,
+		usePos:   usePos,
+		quoteSym: hypoSym,
+		quote:    hypoQuote,
+		useQuote: useQuote,
+	})
+}
+
+// valuationWithLocked 在共用持仓估值之上加回现金得到净值，再以基准净值减当前净值
+// 得到日内亏损（浮盈记零）；现金加市值或亏损差值溢出 int64 时 ok 为 false。
+func (e *Engine) valuationWithLocked(scope valuationScope) (RiskValuation, []RiskQuoteRef, bool) {
+	pv, ok := e.positionValuationLocked(scope)
+	if !ok {
+		return RiskValuation{}, nil, false
+	}
+	equity, ok := addInt64(scope.cash, pv.holding)
+	if !ok {
+		return RiskValuation{}, nil, false
+	}
 	loss, ok := subLoss(e.riskBaseline, equity)
 	if !ok {
 		return RiskValuation{}, nil, false
 	}
-	return RiskValuation{Equity: equity, Loss: loss}, refs, true
+	return RiskValuation{Equity: equity, Loss: loss}, pv.refs, true
 }
 
 // subLoss 返回基准净值减当前净值；浮盈（差值为负）记零。差值溢出时 ok 为 false。
@@ -1800,6 +1909,40 @@ type amtTotals struct {
 	refs     []RiskQuoteRef
 }
 
+// amountTotalsLocked 按当前状态计算两类金额、合计与参与计算的报价定位。
+// 任何乘积或求和溢出 int64 时 ok 为 false。
+func (e *Engine) amountTotalsLocked() (amtTotals, bool) {
+	return e.amountTotalsShadowLocked("", Quote{}, nil)
+}
+
+// amountTotalsShadowLocked 在影子状态上试算：
+// quoteSym 非空时以 quote 作为该合约的最新已生效报价（报价链预检）；
+// canceled 中的订单编号视为已撤销，不贡献买单占用。
+// 持仓市值、报价选择、排序、报价定位与溢出检查全部复用与日内亏损净值相同的
+// positionValuationLocked；这里只在其之上合计 持仓市值 + 买单剩余量占用。
+func (e *Engine) amountTotalsShadowLocked(quoteSym string, quote Quote, canceled map[int64]bool) (amtTotals, bool) {
+	pv, ok := e.positionValuationLocked(valuationScope{
+		quoteSym:   quoteSym,
+		quote:      quote,
+		useQuote:   quoteSym != "",
+		withOrders: true,
+		canceled:   canceled,
+	})
+	if !ok {
+		return amtTotals{}, false
+	}
+	total, ok := addInt64(pv.holding, pv.reserved)
+	if !ok {
+		return amtTotals{}, false
+	}
+	return amtTotals{
+		holding:  pv.holding,
+		reserved: pv.reserved,
+		total:    total,
+		refs:     pv.refs,
+	}, true
+}
+
 // SetPositionAmountLimit 显式设置账户总持仓金额上限（非负 int64），跨交易日保留。
 // 上限只约束多个合约合计的“持仓市值 + 有效买单剩余量占用”。
 // 首次设置与每次调整后都立即按当前状态收敛超限（见包注释），返回本次被撤销的
@@ -1849,95 +1992,6 @@ func (e *Engine) PositionAmountStatus() PositionAmountStatus {
 		st.Total = t.total
 	}
 	return st
-}
-
-// amountTotalsLocked 按当前状态计算两类金额、合计与参与计算的报价定位。
-// 任何乘积或求和溢出 int64 时 ok 为 false。
-func (e *Engine) amountTotalsLocked() (amtTotals, bool) {
-	t, ok := e.amountTotalsShadowLocked("", Quote{}, nil)
-	return t, ok
-}
-
-// amountTotalsShadowLocked 在影子状态上试算：
-// quoteSym 非空时以 quote 作为该合约的最新已生效报价（报价链预检）；
-// canceled 中的订单编号视为已撤销，不贡献买单占用。
-func (e *Engine) amountTotalsShadowLocked(quoteSym string, quote Quote, canceled map[int64]bool) (amtTotals, bool) {
-	var out amtTotals
-
-	syms := make([]string, 0, len(e.symbols))
-	for s := range e.symbols {
-		syms = append(syms, s)
-	}
-	sort.Strings(syms)
-
-	for _, s := range syms {
-		st := e.symbols[s]
-
-		hasQuote := st.hasQuote
-		q := st.latest
-		if s == quoteSym {
-			hasQuote = true
-			q = quote
-		}
-
-		contributed := false
-
-		// 已持仓金额：持仓数量 × 最新已生效报价。卖单占用的持仓不抵减。
-		if st.position != 0 && hasQuote {
-			marketValue, ok := mulPosInt64(st.position, q.Price)
-			if !ok {
-				return amtTotals{}, false
-			}
-			out.holding, ok = addInt64(out.holding, marketValue)
-			if !ok {
-				return amtTotals{}, false
-			}
-			contributed = true
-		}
-
-		// 买单剩余量占用：Σ 剩余量 × max(限价, 最新报价)。
-		var symReserved int64
-		for _, id := range st.buyOrderIDs {
-			if canceled != nil && canceled[id] {
-				continue
-			}
-			o := e.orders[id]
-			if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
-				continue
-			}
-			rem := o.Remaining()
-			if rem <= 0 || !hasQuote {
-				continue // 买单接受时必有有效报价；无报价则不贡献占用
-			}
-			// 单价口径与接受新买单、修改买单共用 buyReservedUnit（q 已按影子报价
-			// 覆盖，行情链预检因此与实际生效逐条一致）。
-			need, ok := mulPosInt64(rem, buyReservedUnit(hasQuote, q.Price, o.Limit))
-			if !ok {
-				return amtTotals{}, false
-			}
-			symReserved, ok = addInt64(symReserved, need)
-			if !ok {
-				return amtTotals{}, false
-			}
-			contributed = true
-		}
-		var ok bool
-		out.reserved, ok = addInt64(out.reserved, symReserved)
-		if !ok {
-			return amtTotals{}, false
-		}
-
-		if contributed {
-			out.refs = append(out.refs, RiskQuoteRef{Symbol: s, Seq: q.Seq, Moment: q.Moment, Price: q.Price})
-		}
-	}
-
-	total, ok := addInt64(out.holding, out.reserved)
-	if !ok {
-		return amtTotals{}, false
-	}
-	out.total = total
-	return out, true
 }
 
 // activeBuyIDsShadowLocked 返回全部仍有剩余量的买单编号，按编号从大到小排列；
