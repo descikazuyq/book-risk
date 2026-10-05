@@ -911,50 +911,34 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 
 	o := e.orders[t.OrderID]
 	st := e.symbols[o.Symbol]
-	amount, _ := mulPositive(t.Price, t.Qty) // validateFill 已校验单笔成交金额可乘，此处必然安全
 
-	// 卖出成交的现金结算必须始终可表示：卖出所得加回现金余额后超出 int64 范围时
-	// 整笔拒绝，不依赖日内亏损保护是否开启，也不以设置账户总持仓金额上限为前提。
-	// 除一条拒绝记录外不改变任何业务状态（成交编号不被占用，持仓与卖单占用保留）。
-	if o.Side == Sell {
-		if _, ok := addInt64(e.cash, amount); !ok {
-			e.appendRecord(Record{
-				Kind:       RecordRejected,
-				Symbol:     o.Symbol,
-				Side:       o.Side,
-				OrderID:    o.ID,
-				TradeID:    t.TradeID,
-				Qty:        t.Qty,
-				TradePrice: t.Price,
-				Reason: fmt.Sprintf("卖出所得 %d 加入现金余额 %d 后超出 int64 范围，整笔拒绝",
-					amount, e.cash),
-			}, st)
-			return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
-		}
+	// 同一笔成交的现金与持仓结算只在此试算一次：成交前的现金/净值检查与
+	// 成功后的实际入账共用同一份结算结果，不会检查一套、记账另一套。
+	// 卖出所得加回现金越界时 ok 为 false：该检查始终生效，不依赖日内亏损
+	// 保护是否开启，也不以设置账户总持仓金额上限为前提。越界时整笔拒绝，
+	// 除一条拒绝记录外不改变任何业务状态（成交编号不被占用，持仓与卖单
+	// 占用保留）。
+	settle, ok := e.settleFillLocked(o, st, t)
+	if !ok {
+		e.appendRecord(Record{
+			Kind:       RecordRejected,
+			Symbol:     o.Symbol,
+			Side:       o.Side,
+			OrderID:    o.ID,
+			TradeID:    t.TradeID,
+			Qty:        t.Qty,
+			TradePrice: t.Price,
+			Reason: fmt.Sprintf("卖出所得 %d 加入现金余额 %d 后超出 int64 范围，整笔拒绝",
+				settle.amount, e.cash),
+		}, st)
+		return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
 	}
 
-	// 启用风险保护时：先在假设成交后的状态上试算净值。越界则整笔拒绝，
-	// 除拒绝记录外不改变任何业务状态（成交编号也不被占用）。
+	// 启用风险保护时：先在成交后的假设状态上试算净值与亏损——现金与持仓取
+	// 同一份结算结果，报价仍用最新已生效报价（等待补齐的报价不参与）。
+	// 越界则整笔拒绝，除拒绝记录外不改变任何业务状态（成交编号也不被占用）。
 	if e.riskOpen {
-		var hypoCash, hypoPos int64
-		arithOK := true
-		if o.Side == Buy {
-			hypoCash, arithOK = subInt64(e.cash, amount) // 成交金额不超过买单占用，余额不会为负
-			if arithOK {
-				hypoPos, arithOK = addInt64(st.position, t.Qty)
-			}
-		} else {
-			hypoCash, arithOK = addInt64(e.cash, amount) // 上方已预检，此处必然安全
-			if arithOK {
-				hypoPos, arithOK = subInt64(st.position, t.Qty) // 可卖校验保证持仓足量
-			}
-		}
-		if arithOK {
-			if _, _, ok := e.valuationHypoLocked(hypoCash, o.Symbol, hypoPos, true, Quote{}, false); !ok {
-				arithOK = false
-			}
-		}
-		if !arithOK {
+		if _, _, ok := e.valuationHypoLocked(settle.cash, o.Symbol, settle.pos, true, Quote{}, false); !ok {
 			e.appendRecord(Record{
 				Kind:       RecordRejected,
 				Symbol:     o.Symbol,
@@ -969,17 +953,17 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 		}
 	}
 
+	// 实际入账：现金与持仓直接采用成交前检查用过的同一份结算结果。
+	// 买单按本次成交部分释放限价占用（价差立即释放），未成交部分继续占用；
+	// 卖单只减少本次成交部分的可卖占用，不提前处理未成交部分。
 	if o.Side == Buy {
-		// 释放限价占用，按实际成交金额扣现金；价差立即释放。
 		e.reservedCash -= o.Limit * t.Qty
-		e.cash -= amount
-		st.position += t.Qty
 		st.reservedBuy -= t.Qty
 	} else {
-		e.cash += amount
-		st.position -= t.Qty
 		st.reservedSell -= t.Qty
 	}
+	e.cash = settle.cash
+	st.position = settle.pos
 	o.Filled += t.Qty
 	if o.Filled == o.Qty {
 		o.Status = StatusFilled
@@ -1059,6 +1043,50 @@ func (e *Engine) validateFill(t Trade) string {
 		return fmt.Sprintf("成交价 %d × 数量 %d 超出整数范围", t.Price, t.Qty)
 	}
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// 成交结算
+//
+// 同一笔成交的现金与持仓结算规则只在 settleFillLocked 维护，成交前的现金/
+// 净值检查与成功后的实际入账共用同一份 fillSettlement，保证两个时点口径一致：
+//
+//   - 买入：现金只扣本次成交金额（成交价 × 成交量），持仓增加本次成交量；
+//     限价 × 成交量的现金占用按本次成交部分释放，未成交部分继续占用；
+//   - 卖出：本次所得加回现金，持仓与卖单占用减少本次成交量，不提前处理
+//     未成交部分。
+//
+// 订单累计成交量与状态随本次成交更新，其他订单的占用保持不变。
+// ---------------------------------------------------------------------------
+
+// fillSettlement 是一笔成交按唯一结算规则试算出的入账结果。
+type fillSettlement struct {
+	amount int64 // 本次成交金额：成交价 × 成交量
+	cash   int64 // 入账后的现金余额
+	pos    int64 // 入账后该合约的持仓
+}
+
+// settleFillLocked 按上述规则计算一笔成交的结算结果。成交金额的可乘性由
+// validateFill 保证；买单现金扣减（成交金额不超过该单现金占用）、买单持仓
+// 增加（持仓限额约束）与卖单持仓扣减（可卖校验）都不会越界。卖出所得加回
+// 现金余额可能越界，此时 ok 为 false 且 amount 已填好供拒绝原因使用；
+// 该检查始终生效，不依赖任何保护或限额是否开启，余额恰好达到 int64 最大值
+// 允许。调用时须持有引擎锁。
+func (e *Engine) settleFillLocked(o *Order, st *symbolState, t Trade) (fillSettlement, bool) {
+	amount, _ := mulPositive(t.Price, t.Qty) // validateFill 已校验单笔成交金额可乘
+	s := fillSettlement{amount: amount}
+	if o.Side == Buy {
+		s.cash = e.cash - amount
+		s.pos = st.position + t.Qty
+	} else {
+		cash, ok := addInt64(e.cash, amount)
+		if !ok {
+			return s, false
+		}
+		s.cash = cash
+		s.pos = st.position - t.Qty
+	}
+	return s, true
 }
 
 // Cancel 撤销订单：只释放未成交部分占用的现金或持仓，已成交部分保留。
