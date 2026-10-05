@@ -767,17 +767,18 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 	// 绕过限额检查，否则会等到成交后才暴露负持仓。溢出时整笔拒绝并返回
 	// ErrInt64Overflow；合计可表示但超过限额时仍按原有超限原因拒绝。
 	// （卖单不占用持仓额度；卖单在真正成交前也不能提前抵减持仓。）
+	// 数量合计、超限与溢出判断与 Modify 共用 checkPositionLimit，规则只维护一处；
+	// 新买单此前没有本单占用，旧剩余量按 0 处理。
 	positionOverflow := false
 	if reason == "" && side == Buy {
-		used, ok1 := addInt64(st.position, st.reservedBuy)
-		apply, ok2 := addInt64(used, qty)
-		if !ok1 || !ok2 {
+		check := checkPositionLimit(st, 0, qty)
+		if check.overflow {
 			positionOverflow = true
 			reason = fmt.Sprintf("持仓数量合计超出 int64 范围: 本次申请 %d + 已持仓 %d + 有效买单剩余 %d 超过最大持仓量 %d，买单整体拒绝",
 				qty, st.position, st.reservedBuy, st.maxPosition)
-		} else if apply > st.maxPosition {
+		} else if check.over {
 			reason = fmt.Sprintf("超过最大持仓量 %d: 已持仓 %d + 买单剩余 %d + 本次 %d",
-				st.maxPosition, st.position, st.reservedBuy, qty)
+				st.maxPosition, st.position, check.used, qty)
 		}
 	}
 
@@ -1228,16 +1229,17 @@ func (e *Engine) Modify(orderID, newQty, newLimit int64) error {
 			}
 		}
 		if reason == "" {
-			// 合约持仓限额：同样只替换本订单的旧占用。
-			newReserved, ok1 := subInt64(st.reservedBuy, oldRemaining)
-			newPositionUsed, ok2 := addInt64(st.position, newReserved)
-			newPositionUsed, ok3 := addInt64(newPositionUsed, newRemaining)
-			if !ok1 || !ok2 || !ok3 {
+			// 合约持仓限额：本单旧剩余量先从占用中扣除，再由新剩余量替代，其他
+			// 买单的占用保留；新总量中已成交部分只计入持仓，不能再作为未成交占用。
+			// 数量合计、超限与溢出判断与接受新买单共用 checkPositionLimit，同一条
+			// 数量限额规则只维护一处。
+			check := checkPositionLimit(st, oldRemaining, newRemaining)
+			if check.overflow {
 				overflow = true
 				reason = "修改后持仓限额占用计算超出 int64 范围，修改拒绝"
-			} else if newPositionUsed > st.maxPosition {
+			} else if check.over {
 				reason = fmt.Sprintf("修改后超过最大持仓量 %d: 已持仓 %d + 买单剩余 %d",
-					st.maxPosition, st.position, newReserved+newRemaining)
+					st.maxPosition, st.position, check.used+newRemaining)
 			}
 		}
 		if reason == "" && len(st.pending) > 0 {
@@ -1352,6 +1354,49 @@ func buyReservedUnit(hasQuote bool, quotePrice, limit int64) int64 {
 // 调用时须持有引擎锁。
 func buyReservedAmount(st *symbolState, remaining, limit int64) (int64, bool) {
 	return mulPosInt64(remaining, buyReservedUnit(st.hasQuote, st.latest.Price, limit))
+}
+
+// ---------------------------------------------------------------------------
+// 合约最大持仓数量限额
+//
+// 同一条数量限额规则在接受新买单（Buy）与修改有效买单（Modify）两处共用，
+// 数量合计、超限与溢出判断只在 checkPositionLimit 维护：
+//
+//	申请后数量占用 = 该合约已持仓数量
+//	             + 该合约其他有效买单的未成交部分
+//	             + 本次申请买单的未成交数量
+//
+//   - 只计算当前合约：其他合约的订单不占用本合约的数量额度；
+//   - 新买单以申请总量作为“本次申请未成交数量”，此前没有本单占用
+//     （replaceRemaining 传 0）；
+//   - 修改买单以“新总量 − 已成交量”替换本单旧剩余量（replaceRemaining 传旧
+//     剩余量）：新总量中已经成交的部分只计入持仓，不能再作为未成交占用；
+//     其他买单的占用保留；
+//   - 已撤销与全部成交的买单没有有效剩余占用（不在 reservedBuy 内）；卖单成交
+//     前也不能提前抵减已持仓数量；
+//   - 合计恰好等于最大持仓量时允许，超过时按普通超限拒绝；数量本身合法而合计
+//     超出 int64 范围时整体拒绝（ErrInt64Overflow），不能让数值回绕后绕过限额。
+// ---------------------------------------------------------------------------
+
+// positionLimitCheck 是一次合约数量限额试算的结果。
+type positionLimitCheck struct {
+	used     int64 // 除本单外的有效买单未成交占用（reservedBuy 扣除本单旧剩余量）
+	overflow bool  // 申请后合计计算超出 int64 范围；此时 over 无意义
+	over     bool  // 申请后合计（已持仓 + used + 申请未成交数量）超过最大持仓量；恰好等于不算超限
+}
+
+// checkPositionLimit 按上述唯一的数量限额规则试算。replaceRemaining 为本单旧
+// 剩余量（接受新买单时传 0），applyRemaining 为本次申请买单的未成交数量（新买单
+// 为申请总量；修改买单为新总量减去已成交量）。合计溢出 int64 时只置 overflow，
+// 不回绕出一个伪合计；可表示时再与 st.maxPosition 比较，恰好等于不算超限。
+func checkPositionLimit(st *symbolState, replaceRemaining, applyRemaining int64) positionLimitCheck {
+	used, ok1 := subInt64(st.reservedBuy, replaceRemaining)
+	apply, ok2 := addInt64(st.position, used)
+	apply, ok3 := addInt64(apply, applyRemaining)
+	if !ok1 || !ok2 || !ok3 {
+		return positionLimitCheck{used: used, overflow: true}
+	}
+	return positionLimitCheck{used: used, over: apply > st.maxPosition}
 }
 
 // amtRejectDetail 是账户总持仓金额上限拒绝记录要固化的金额快照，新买单与修改买单
