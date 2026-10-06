@@ -878,16 +878,7 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 			prev.price != t.Price || prev.qty != t.Qty {
 			reason := fmt.Sprintf("成交编号 %d 已用于不同内容的成交: 原有 (订单=%d, 合约=%s, 方向=%s, 价格=%d, 数量=%d)",
 				t.TradeID, prev.orderID, prev.symbol, prev.side, prev.price, prev.qty)
-			e.appendRecord(Record{
-				Kind:       RecordRejected,
-				Symbol:     t.Symbol,
-				Side:       t.Side,
-				OrderID:    t.OrderID,
-				TradeID:    t.TradeID,
-				Qty:        t.Qty,
-				TradePrice: t.Price,
-				Reason:     reason,
-			}, e.symbols[t.Symbol])
+			e.appendFillRejectLocked(t, reason)
 			return FillResult{}, fmt.Errorf("%s", reason)
 		}
 		return prev.result, nil // 幂等重放：返回原结果，不新增事件、不再次记账
@@ -895,17 +886,7 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 
 	reason := e.validateFill(t)
 	if reason != "" {
-		st := e.symbols[t.Symbol]
-		e.appendRecord(Record{
-			Kind:       RecordRejected,
-			Symbol:     t.Symbol,
-			Side:       t.Side,
-			OrderID:    t.OrderID,
-			TradeID:    t.TradeID,
-			Qty:        t.Qty,
-			TradePrice: t.Price,
-			Reason:     reason,
-		}, st)
+		e.appendFillRejectLocked(t, reason)
 		return FillResult{}, fmt.Errorf("成交 %d 被拒绝: %s", t.TradeID, reason)
 	}
 
@@ -920,17 +901,8 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	// 占用保留）。
 	settle, ok := e.settleFillLocked(o, st, t)
 	if !ok {
-		e.appendRecord(Record{
-			Kind:       RecordRejected,
-			Symbol:     o.Symbol,
-			Side:       o.Side,
-			OrderID:    o.ID,
-			TradeID:    t.TradeID,
-			Qty:        t.Qty,
-			TradePrice: t.Price,
-			Reason: fmt.Sprintf("卖出所得 %d 加入现金余额 %d 后超出 int64 范围，整笔拒绝",
-				settle.amount, e.cash),
-		}, st)
+		e.appendFillRejectLocked(t, fmt.Sprintf("卖出所得 %d 加入现金余额 %d 后超出 int64 范围，整笔拒绝",
+			settle.amount, e.cash))
 		return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
 	}
 
@@ -939,16 +911,7 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	// 越界则整笔拒绝，除拒绝记录外不改变任何业务状态（成交编号也不被占用）。
 	if e.riskOpen {
 		if _, _, ok := e.valuationHypoLocked(settle.cash, o.Symbol, settle.pos, true, Quote{}, false); !ok {
-			e.appendRecord(Record{
-				Kind:       RecordRejected,
-				Symbol:     o.Symbol,
-				Side:       o.Side,
-				OrderID:    o.ID,
-				TradeID:    t.TradeID,
-				Qty:        t.Qty,
-				TradePrice: t.Price,
-				Reason:     fmt.Sprintf("成交 %d 入账将使净值或亏损超出 int64 范围，整笔拒绝", t.TradeID),
-			}, st)
+			e.appendFillRejectLocked(t, fmt.Sprintf("成交 %d 入账将使净值或亏损超出 int64 范围，整笔拒绝", t.TradeID))
 			return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
 		}
 	}
@@ -1043,6 +1006,33 @@ func (e *Engine) validateFill(t Trade) string {
 		return fmt.Sprintf("成交价 %d × 数量 %d 超出整数范围", t.Price, t.Qty)
 	}
 	return ""
+}
+
+// appendFillRejectLocked 追加一条成交拒绝记录，是 Fill 全部拒绝路径（成交编号
+// 内容冲突、普通校验失败、卖出所得加回现金越界、入账后净值或亏损越界）共用的
+// 唯一记录入口，保证回报内容与当时快照的保留规则只在此维护：
+//
+//   - 记录原样保存本次提交的订单编号、成交编号、合约、方向、成交价与数量；
+//     合约或方向填错、或另一订单借用已入账编号时，绝不用原订单或第一次成交的
+//     内容覆盖这次回报；
+//   - 报价快照取本次回报合约当时的最新已生效报价，持仓限额取当时设置；尚未
+//     具备的快照保持无效，等待补齐的报价不参与；
+//   - 已开启交易日时同时固化提交前的日号、基准净值、当前净值、亏损、上限与
+//     限制状态，未开日保持零值（均由 appendRecord 统一完成）。
+//
+// 每次拒绝只增加这一条事件：现金、持仓、买卖单占用、累计成交量与订单状态维持
+// 提交前值，既有记录不被改写，未入账的成交编号也不被占用。调用时须持有引擎锁。
+func (e *Engine) appendFillRejectLocked(t Trade, reason string) {
+	e.appendRecord(Record{
+		Kind:       RecordRejected,
+		Symbol:     t.Symbol,
+		Side:       t.Side,
+		OrderID:    t.OrderID,
+		TradeID:    t.TradeID,
+		Qty:        t.Qty,
+		TradePrice: t.Price,
+		Reason:     reason,
+	}, e.symbols[t.Symbol])
 }
 
 // ---------------------------------------------------------------------------
