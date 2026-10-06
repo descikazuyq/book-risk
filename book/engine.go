@@ -865,6 +865,12 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 // 卖出成交的现金结算始终检查可表示性：卖出所得加回现金余额后超出 int64 范围时
 // 整笔拒绝（返回包装 ErrInt64Overflow 的错误），不依赖日内亏损保护是否开启，
 // 也不以设置账户总持仓金额上限为前提；现金增加后恰好等于 int64 最大值允许。
+// 正成交编号的失败回报（编号内容冲突、普通校验失败、卖出所得加回现金越界、
+// 成交后净值或亏损越界）走同一条拒绝出口：返回错误与零值成交结果，且只在事件
+// 末尾追加一条拒绝记录。记录原样保存本次提交的订单编号、成交编号、合约、方向、
+// 成交价与数量，并按本次回报合约固化当时的报价与持仓限额快照；判断先后与错误
+// 文案保持不变——现金加回越界与成交后净值/亏损越界返回包装 ErrInt64Overflow
+// 的错误，单笔成交价 × 数量本身越界仍按普通成交拒绝处理。
 func (e *Engine) Fill(t Trade) (FillResult, error) {
 	if t.TradeID <= 0 {
 		return FillResult{}, fmt.Errorf("成交编号必须为正: %d", t.TradeID)
@@ -873,39 +879,26 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// 已入账编号的判断先于一切其他校验：相同内容重放直接返回第一次结果，
+	// 不新增记录、不再次记账（即使订单此后被修改或撤销）；内容冲突则按下面的
+	// 统一拒绝出口只记一次。占用表只在成功入账时写入，被拒回报不占用编号，
+	// 修正内容后同一编号仍可提交。
 	if prev, ok := e.fills[t.TradeID]; ok {
 		if prev.orderID != t.OrderID || prev.symbol != t.Symbol || prev.side != t.Side ||
 			prev.price != t.Price || prev.qty != t.Qty {
 			reason := fmt.Sprintf("成交编号 %d 已用于不同内容的成交: 原有 (订单=%d, 合约=%s, 方向=%s, 价格=%d, 数量=%d)",
 				t.TradeID, prev.orderID, prev.symbol, prev.side, prev.price, prev.qty)
-			e.appendRecord(Record{
-				Kind:       RecordRejected,
-				Symbol:     t.Symbol,
-				Side:       t.Side,
-				OrderID:    t.OrderID,
-				TradeID:    t.TradeID,
-				Qty:        t.Qty,
-				TradePrice: t.Price,
-				Reason:     reason,
-			}, e.symbols[t.Symbol])
+			e.appendFillRejectLocked(t, reason)
 			return FillResult{}, fmt.Errorf("%s", reason)
 		}
 		return prev.result, nil // 幂等重放：返回原结果，不新增事件、不再次记账
 	}
 
-	reason := e.validateFill(t)
-	if reason != "" {
-		st := e.symbols[t.Symbol]
-		e.appendRecord(Record{
-			Kind:       RecordRejected,
-			Symbol:     t.Symbol,
-			Side:       t.Side,
-			OrderID:    t.OrderID,
-			TradeID:    t.TradeID,
-			Qty:        t.Qty,
-			TradePrice: t.Price,
-			Reason:     reason,
-		}, st)
+	// 普通成交校验：合约、方向、价格、数量、订单存在性与状态、剩余量、限价。
+	// 单笔成交价 × 数量本身越界在这里按普通拒绝处理（不包装 ErrInt64Overflow），
+	// 不与下面的卖出所得加回现金越界或成交后净值/亏损越界混为同一种错误。
+	if reason := e.validateFill(t); reason != "" {
+		e.appendFillRejectLocked(t, reason)
 		return FillResult{}, fmt.Errorf("成交 %d 被拒绝: %s", t.TradeID, reason)
 	}
 
@@ -920,17 +913,9 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	// 占用保留）。
 	settle, ok := e.settleFillLocked(o, st, t)
 	if !ok {
-		e.appendRecord(Record{
-			Kind:       RecordRejected,
-			Symbol:     o.Symbol,
-			Side:       o.Side,
-			OrderID:    o.ID,
-			TradeID:    t.TradeID,
-			Qty:        t.Qty,
-			TradePrice: t.Price,
-			Reason: fmt.Sprintf("卖出所得 %d 加入现金余额 %d 后超出 int64 范围，整笔拒绝",
-				settle.amount, e.cash),
-		}, st)
+		reason := fmt.Sprintf("卖出所得 %d 加入现金余额 %d 后超出 int64 范围，整笔拒绝",
+			settle.amount, e.cash)
+		e.appendFillRejectLocked(t, reason)
 		return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
 	}
 
@@ -939,16 +924,8 @@ func (e *Engine) Fill(t Trade) (FillResult, error) {
 	// 越界则整笔拒绝，除拒绝记录外不改变任何业务状态（成交编号也不被占用）。
 	if e.riskOpen {
 		if _, _, ok := e.valuationHypoLocked(settle.cash, o.Symbol, settle.pos, true, Quote{}, false); !ok {
-			e.appendRecord(Record{
-				Kind:       RecordRejected,
-				Symbol:     o.Symbol,
-				Side:       o.Side,
-				OrderID:    o.ID,
-				TradeID:    t.TradeID,
-				Qty:        t.Qty,
-				TradePrice: t.Price,
-				Reason:     fmt.Sprintf("成交 %d 入账将使净值或亏损超出 int64 范围，整笔拒绝", t.TradeID),
-			}, st)
+			reason := fmt.Sprintf("成交 %d 入账将使净值或亏损超出 int64 范围，整笔拒绝", t.TradeID)
+			e.appendFillRejectLocked(t, reason)
 			return FillResult{}, fmt.Errorf("成交 %d: %w", t.TradeID, ErrInt64Overflow)
 		}
 	}
@@ -1043,6 +1020,30 @@ func (e *Engine) validateFill(t Trade) string {
 		return fmt.Sprintf("成交价 %d × 数量 %d 超出整数范围", t.Price, t.Qty)
 	}
 	return ""
+}
+
+// appendFillRejectLocked 是成交回报各条拒绝路径唯一的拒绝记录出口：编号内容
+// 冲突、普通校验失败、卖出所得加回现金越界、成交后净值/亏损越界都经此追加，
+// 保证“每次拒绝只在事件末尾增加一条记录”这条规则只维护一处。
+//
+// 记录原样保存本次提交的订单编号、成交编号、合约、方向、成交价与数量——即使
+// 合约或方向与订单不一致（此时不能用订单内容覆盖回报），或编号已被另一张订单
+// 的成交占用（不能用第一次成交的合约），一律以本次回报 t 为准。报价快照取
+// 本次回报合约最新已生效的报价，持仓限额快照取当时设置；合约尚无已生效报价或
+// 尚未设置限额时快照保持无效；等待补齐的报价不参与。交易日已开启时，提交前的
+// 日号、基准净值、当前净值、亏损、上限与限制状态由 appendRecord 一并固化；
+// 未开日保持零值。调用时须持有引擎锁。
+func (e *Engine) appendFillRejectLocked(t Trade, reason string) {
+	e.appendRecord(Record{
+		Kind:       RecordRejected,
+		Symbol:     t.Symbol,
+		Side:       t.Side,
+		OrderID:    t.OrderID,
+		TradeID:    t.TradeID,
+		Qty:        t.Qty,
+		TradePrice: t.Price,
+		Reason:     reason,
+	}, e.symbols[t.Symbol])
 }
 
 // ---------------------------------------------------------------------------
