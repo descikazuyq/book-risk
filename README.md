@@ -221,6 +221,246 @@ func main() {
 返回部分成交，但订单查询仍为部分成交、有效剩余量 5、占用现金 50，剩余量不会
 因这笔成交被撤销，还可以继续提交成交。
 
+### 缺口补齐的时点：报价提交成功、价格恢复后，买单为何仍已撤销
+
+行情跨号时，缺失序号之前的报价只能等待。补齐缺失的一条后，引擎把连续的等待
+报价按序号**在同一次调用内逐条生效**：每一条都各自重算一次日内亏损。于是完全
+可能出现“`UpdateQuote` 返回成功、最新价格已经恢复，先前挂着的买单却已被风险
+保护撤销”——撤单发生在这批报价的**中间一条**上，一旦触线，增险限制保留到
+下一交易日，批末价格再怎么恢复都不会解除，也不会恢复已撤销的订单。
+
+调用方据此分别做两个判断，二者不要互相替代：
+
+1. **行情是否推进**——看 `UpdateQuote` 返回的新生效条数，再用 `CurrentQuote`
+   与 `HasGap` 复核：最新序号推进、缺口消失才表示等待价格已经用上。
+2. **订单还能不能成交**——以重新查询的 `Order` 为准：状态为已撤销或
+   `Remaining()` 为 0 后，再提交成交只会被拒绝；价格恢复不改变这个结论。
+
+下例从创建引擎开始独立走一遍：账户 1000 现金、合约 A 限额 100、首条报价
+seq1@10；一张 10 股限价 10 的买单先成交 5 股，再明确开启日号 1、亏损上限 10
+（基准净值 1000）。随后让跨号的 seq3@10（恢复价）先到并等待，再提交缺失的
+seq2@8：seq2@8 使净值 990、亏损 10 恰好达到上限，seq3@10 把净值恢复回 1000。
+本次调用连续生效两条报价。
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/descikazuyq/book-risk/book"
+)
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func main() {
+	e, err := book.NewEngine(1000) // 创建账户
+	must(err)
+	_, err = e.SetMaxPosition("A", 100) // 设置合约持仓限额
+	must(err)
+
+	n, err := e.UpdateQuote("A", book.Quote{Seq: 1, Moment: 10, Price: 10}) // 首条报价
+	must(err)
+	fmt.Println("首条报价新生效条数:", n)
+
+	// 已生效报价的相同内容重复提交：成功返回但 0 条、无缺口、无新事件。
+	n, err = e.UpdateQuote("A", book.Quote{Seq: 1, Moment: 10, Price: 10})
+	must(err)
+	q, _ := e.CurrentQuote("A")
+	fmt.Println("已生效报价同内容重提: 条数", n, "缺口", e.HasGap("A"), "最新报价", q.Seq)
+
+	// 10 股限价 10 的买单只成交 5 股：下单冻结 100，成交后剩余 5 股继续冻结 50。
+	id, err := e.Buy("A", 10, 10)
+	must(err)
+	res, err := e.Fill(book.Trade{TradeID: 1, OrderID: id, Symbol: "A", Side: book.Buy, Price: 10, Qty: 5})
+	must(err)
+	fmt.Println("成交: 本次", res.Qty, "累计", res.Filled, "剩余", res.Remaining, res.Status)
+
+	// 明确开启交易日：日号 1、亏损上限 10；基准净值 = 950 + 5×10 = 1000。
+	must(e.StartTradingDay(1, 10))
+
+	// 跨号的 seq3（时刻 30、恢复价 10）先到，只能等待：返回 0 条、出现缺口，
+	// 最新报价停在 seq1，净值不提前采用等待价格。
+	n, err = e.UpdateQuote("A", book.Quote{Seq: 3, Moment: 30, Price: 10})
+	must(err)
+	fmt.Println("跨号报价返回条数:", n, "缺口:", e.HasGap("A"))
+
+	// 等待中的同内容报价再次提交：仍是 0 条、仍有缺口，用缺口查询与“已生效
+	// 报价重复提交”区分。
+	n, err = e.UpdateQuote("A", book.Quote{Seq: 3, Moment: 30, Price: 10})
+	must(err)
+	fmt.Println("等待报价同内容重提: 条数", n, "缺口", e.HasGap("A"))
+
+	// 相同序号但时刻或价格不同：冲突错误，原报价不被替换。
+	_, err = e.UpdateQuote("A", book.Quote{Seq: 3, Moment: 30, Price: 9})
+	fmt.Println("等待序号改价:", err)
+
+	// ---- 补齐前：最新报价、缺口、风险状态与订单状态 ----
+	q, _ = e.CurrentQuote("A")
+	s := e.RiskStatus()
+	o, _ := e.Order(id)
+	fmt.Println("补齐前: 最新报价", q.Seq, q.Moment, q.Price, "缺口", e.HasGap("A"),
+		"净值", s.Equity, "亏损", s.Loss, "限制", s.Restricted)
+	fmt.Println("补齐前: 订单", o.Status, "累计成交", o.Filled, "剩余", o.Remaining(),
+		"现金", e.Cash(), "占用", e.ReservedCash(), "持仓", e.Position("A"))
+
+	// 提交缺失的 seq2（时刻 20、价格 8）：链 seq2@8 → seq3@10 在本次调用中
+	// 连续生效两条。seq2@8 恰好触线，seq3@10 恢复到开日估值水平。
+	n, err = e.UpdateQuote("A", book.Quote{Seq: 2, Moment: 20, Price: 8})
+	must(err)
+	fmt.Println("补齐返回新生效条数:", n) // 只统计新生效报价，不统计同次调用的触线与撤单
+
+	// ---- 补齐后：最新报价已恢复，限制仍在、未成交部分已撤销 ----
+	q, _ = e.CurrentQuote("A")
+	s = e.RiskStatus()
+	fmt.Println("补齐后: 最新报价", q.Seq, q.Moment, q.Price, "缺口", e.HasGap("A"),
+		"净值", s.Equity, "亏损", s.Loss, "限制", s.Restricted)
+	o, _ = e.Order(id)
+	fmt.Println("补齐后: 订单", o.Status, "累计成交", o.Filled, "剩余", o.Remaining(),
+		"现金", e.Cash(), "占用", e.ReservedCash(), "持仓", e.Position("A"))
+	fmt.Println("撤单原因:", o.Reason)
+
+	// 当日增险限制仍然保留：价格恢复后新买单照样被拒绝。
+	_, err = e.Buy("A", 1, 10)
+	fmt.Println("恢复后新买单:", err)
+
+	// 事件记录：当日首次触线记录先于撤销记录，且都固化在中间价 seq2@8。
+	for _, r := range e.Records() {
+		switch r.Kind {
+		case book.RecordRiskTriggered:
+			fmt.Printf("记录: %s 来源=%s 报价序号=%d 时刻=%d 价格=%d 净值=%d 亏损=%d 上限=%d\n",
+				r.Kind, r.RiskTrigger, r.RiskRefSeq, r.RiskRefMoment, r.RiskQuoteRefs[0].Price,
+				r.RiskEquity, r.RiskLoss, r.RiskLimit)
+		case book.RecordCanceled:
+			fmt.Printf("记录: %s 订单=%d 累计成交=%d 本次取消=%d 快照报价=%d@%d 快照净值=%d 快照亏损=%d\n",
+				r.Kind, r.OrderID, r.Filled, r.Remaining, r.QuoteSeq, r.QuotePrice,
+				r.RiskEquity, r.RiskLoss)
+		}
+	}
+}
+```
+
+输出：
+
+```text
+首条报价新生效条数: 1
+已生效报价同内容重提: 条数 0 缺口 false 最新报价 1
+成交: 本次 5 累计 5 剩余 5 部分成交
+跨号报价返回条数: 0 缺口: true
+等待报价同内容重提: 条数 0 缺口 true
+等待序号改价: 等待中的报价序号 3 内容冲突: 已有 (时刻=30, 价格=10)，新值 (时刻=30, 价格=9)
+补齐前: 最新报价 1 10 10 缺口 true 净值 1000 亏损 0 限制 false
+补齐前: 订单 部分成交 累计成交 5 剩余 5 现金 950 占用 50 持仓 5
+补齐返回新生效条数: 2
+补齐后: 最新报价 3 30 10 缺口 false 净值 1000 亏损 0 限制 true
+补齐后: 订单 已撤销 累计成交 5 剩余 0 现金 950 占用 0 持仓 5
+撤单原因: 日内亏损 10 达到或超过上限 10，风险保护撤销全部未成交买单
+恢复后新买单: 买入 A 委托被拒绝: 交易日 1 日内亏损保护已触发（亏损上限 10），拒绝所有新买单
+记录: 风险触线 来源=报价 报价序号=2 时刻=20 价格=8 净值=990 亏损=10 上限=10
+记录: 撤销 订单=1 累计成交=5 本次取消=5 快照报价=2@8 快照净值=990 快照亏损=10
+```
+
+资金与持仓可以逐笔对上例数字核对：
+
+- **下单时**：冻结限价×数量 10×10=100，现金余额仍为 1000。
+- **5 股成交后**：按**成交价**扣 5×10=50，现金 950、持仓 5、订单累计成交 5；
+  未成交的另 5 股继续冻结 5×10=50（占用 50）。
+- **触线撤单时**：只取消未成交的 5 股，释放它的冻结 50（占用 50→0）；现金
+  余额 950、已买入持仓 5、累计成交量 5 全部保留。seq3 把价格恢复到 10 只影响
+  估值，**不会退回成交、不会补回持仓，也不会恢复已撤销订单**。
+
+历史记录与调用结束后的现状之所以不同，是因为记录固化的是**各自发生时点**的
+快照，而最新报价与当前亏损反映的是**整次调用结束后**的状态：
+
+1. `RecordRiskTriggered` 是当日唯一一条触线记录，先于撤销记录写入；它锚定
+   真正触线的中间报价——序号 2、模拟时刻 20、价格 8，以及当时的净值 990、
+   亏损 10、上限 10。
+2. 随后的 `RecordCanceled` 保存同一时点的报价快照（seq2@8）与亏损 10；
+   `Filled=5` 是保留的累计成交，`Remaining=5` 是**本次被取消的数量**。
+3. 链继续推进到 seq3@10 后，`CurrentQuote` 指向序号 3、当前亏损按恢复价
+   重算为 0，但触线记录与撤单原因不会被回头改写——读者正是靠这些历史值得知
+   “限制是被 seq2@8 的 10 元亏损触发的”，而不是被批末价格触发。
+
+`UpdateQuote` 返回的条数只统计**本次新生效的报价**，同一次调用里发生的触线、
+撤单与拒绝都不计入。返回 `0` 条且错误为 `nil` 时，需要结合 `CurrentQuote` 与
+`HasGap` 区分两种情形：报价正在等待（有缺口，如跨号的 seq3），或相同内容的
+报价重复提交（已生效或等待中的同内容重提，均无新事件）。相同序号但时刻或
+价格不同则返回冲突错误，原报价不被替换（无论它已生效还是在等待）。
+
+开启亏损保护后，补齐链在生效前会先按“前一条处理后的状态”逐步预检整条链：
+**任一步净值或亏损计算超出 int64 范围，整批拒绝**——返回包装
+`book.ErrInt64Overflow` 的错误和 0 条生效，只增加一条指出出错序号的拒绝记录；
+已生效报价、原先等待的报价、订单（含本拟触发的撤单）与现金/持仓占用全部保留
+提交前值，修正报价后可用同一批序号重新补齐。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"math"
+
+	"github.com/descikazuyq/book-risk/book"
+)
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func main() {
+	// 现金贴近 int64 上界；买入 1 股成交价 100 后，现金 MaxInt64-200、持仓 1。
+	e, err := book.NewEngine(math.MaxInt64 - 100)
+	must(err)
+	_, err = e.SetMaxPosition("A", 10)
+	must(err)
+	_, err = e.UpdateQuote("A", book.Quote{Seq: 1, Moment: 10, Price: 100})
+	must(err)
+	id, err := e.Buy("A", 1, 100)
+	must(err)
+	_, err = e.Fill(book.Trade{TradeID: 1, OrderID: id, Symbol: "A", Side: book.Buy, Price: 100, Qty: 1})
+	must(err)
+	must(e.StartTradingDay(1, 10)) // 基准净值 = MaxInt64-100
+	bid, err := e.Buy("A", 1, 1)   // 开日后的待成交买单，占用现金 1
+	must(err)
+
+	// 跨号 seq3 是天价：1 股 × MaxInt64 再加现金必然溢出净值；它先等待。
+	_, err = e.UpdateQuote("A", book.Quote{Seq: 3, Moment: 30, Price: math.MaxInt64})
+	must(err)
+	recsBefore := len(e.Records())
+
+	// 补齐 seq2@100：预检走到 seq3 时发现净值溢出，整批拒绝、0 条生效。
+	n, err := e.UpdateQuote("A", book.Quote{Seq: 2, Moment: 20, Price: 100})
+	fmt.Println("溢出补齐: 条数", n, "ErrInt64Overflow =", errors.Is(err, book.ErrInt64Overflow))
+	fmt.Println("错误:", err)
+
+	// 已生效报价、等待报价、风险状态、订单与占用全部保留提交前值。
+	q, _ := e.CurrentQuote("A")
+	st := e.RiskStatus()
+	o, _ := e.Order(bid)
+	fmt.Println("最新报价", q.Seq, q.Price, "缺口", e.HasGap("A"), "限制", st.Restricted, "净值", st.Equity)
+	fmt.Println("订单", o.Status, "剩余", o.Remaining(), "现金", e.Cash(), "占用", e.ReservedCash(), "持仓", e.Position("A"))
+	rj := e.Records()[recsBefore]
+	fmt.Println("仅新增记录数:", len(e.Records())-recsBefore, "类型:", rj.Kind, "原因:", rj.Reason)
+}
+```
+
+输出：
+
+```text
+溢出补齐: 条数 0 ErrInt64Overflow = true
+错误: 报价序号 3: 净值、亏损或持仓金额超出 int64 范围
+最新报价 1 100 缺口 true 限制 false 净值 9223372036854775707
+订单 待成交 剩余 1 现金 9223372036854775607 占用 1 持仓 1
+仅新增记录数: 1 类型: 拒绝 原因: 报价序号 3 生效将使净值或亏损超出 int64 范围，整批拒绝
+```
+
 ## 账户总持仓金额上限
 
 调用方可显式设置账户级（跨全部合约合计）的总持仓金额上限；未设置时保持基线行为，
