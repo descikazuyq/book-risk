@@ -393,9 +393,23 @@ func main() {
 
 开启亏损保护后，补齐链在生效前会先按“前一条处理后的状态”逐步预检整条链：
 **任一步净值或亏损计算超出 int64 范围，整批拒绝**——返回包装
-`book.ErrInt64Overflow` 的错误和 0 条生效，只增加一条指出出错序号的拒绝记录；
-已生效报价、原先等待的报价、订单（含本拟触发的撤单）与现金/持仓占用全部保留
-提交前值，修正报价后可用同一批序号重新补齐。
+`book.ErrInt64Overflow` 的错误和 0 条生效，只增加一条指出**出错序号**（链上
+真正算不出来的那一条，不一定是本次提交的序号）的拒绝记录；已生效报价、订单
+（含本拟触发的撤单）与现金/持仓占用全部保留提交前值。拒绝后要区分两类报价的
+去向，它们都还在，但用法完全不同：
+
+- **本次补交的缺失报价**：它与链上各条都没有写入——既没有生效，也没有转入
+  等待，序号不被占用。用**相同内容再次提交同一条缺失报价**就是一次全新的补齐
+  调用，会按当时的账户状态重新预检整条链；若账户状态已经改变（例如持仓已卖出，
+  等待中的天价不再参与估值），同一条报价这次就可以连续生效。
+- **此前已经等待的报价**：保留**第一次接收**的时刻与价格。相同内容重提只会
+  成功返回 0 条生效（错误为 `nil`），不会借这次提交重试整条链；用相同序号提交
+  不同价格或时刻则直接返回“内容冲突”错误，等待内容、最新报价、缺口与全部业务
+  状态保持原值，也不新增记录。等待报价无法就地修正：要让它不再挡住链，只能改变
+  账户自身状态（如卖出持仓使该价格不参与估值），不能改报价本身。
+
+交易只改变账户、不推进行情：卖出成交后缺口与等待报价原样保留，仍需重新补交缺失
+报价；卖单只被接受、尚未成交时也不能当作持仓已经减少。
 
 ```go
 package main
@@ -460,6 +474,182 @@ func main() {
 订单 待成交 剩余 1 现金 9223372036854775607 占用 1 持仓 1
 仅新增记录数: 1 类型: 拒绝 原因: 报价序号 3 生效将使净值或亏损超出 int64 范围，整批拒绝
 ```
+
+### 估值溢出整批拒绝后：等待的报价仍在，持仓变了才能再补齐
+
+下面的例子从创建引擎开始独立走一遍，展示补齐失败后**哪些报价仍被保留**：
+初始现金 1000，先给合约 A 设置足够的持仓限额；序号 1、价格 5 的报价生效后，
+以价格 5 买入并成交 2 份（现金 990、持仓 2），再开启日号 1、亏损上限 100 的
+交易日（基准净值 1000）。让序号 3、价格为 int64 最大值的报价先进入等待，再
+补交序号 2、价格 5：2 份持仓按等待天价算市值时溢出，本次 0 条生效并返回
+`ErrInt64Overflow`，最新报价仍是序号 1，持仓 2、现金 990、基准净值 1000 与
+“未限制”状态全部保留，只增加一条指出出错序号 3 的拒绝记录。
+
+随后在缺口期间通过一张正常卖单以价格 5 卖出全部 2 份并成交记账（现金 1000、
+持仓 0），再重新提交缺失的序号 2：持仓清零后等待天价不再参与估值，本次调用
+连续生效序号 2 和 3，最新报价保留**原序号 3 的时刻与高价**，缺口消失，净值
+仍为 1000、亏损为零。卖出只改变账户、不推进行情，仍需重新补交缺失报价。
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"math"
+
+	"github.com/descikazuyq/book-risk/book"
+)
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func main() {
+	// 从创建引擎开始：初始现金 1000，合约 A 持仓限额 100。
+	e, err := book.NewEngine(1000)
+	must(err)
+	_, err = e.SetMaxPosition("A", 100)
+	must(err)
+
+	// 序号 1、价格 5 的报价先生效。
+	n, err := e.UpdateQuote("A", book.Quote{Seq: 1, Moment: 10, Price: 5})
+	must(err)
+	fmt.Println("seq1 生效条数:", n)
+
+	// 以价格 5 买入 2 份并立即成交：现金 1000-2×5=990，持仓 2。
+	bid, err := e.Buy("A", 2, 5)
+	must(err)
+	buyRes, err := e.Fill(book.Trade{TradeID: 1, OrderID: bid, Symbol: "A", Side: book.Buy, Price: 5, Qty: 2})
+	must(err)
+	fmt.Println("买入成交: 本次", buyRes.Qty, "累计", buyRes.Filled, "剩余", buyRes.Remaining, buyRes.Status)
+	fmt.Println("现金 持仓:", e.Cash(), e.Position("A"))
+
+	// 开启日号 1、亏损上限 100 的交易日：基准净值 = 990 + 2×5 = 1000。
+	must(e.StartTradingDay(1, 100))
+	s := e.RiskStatus()
+	fmt.Println("开日: 基准", s.Baseline, "净值", s.Equity, "亏损", s.Loss, "限制", s.Restricted)
+
+	// 序号 3、价格为 int64 最大值的报价跨号先到，进入等待（不参与估值）。
+	n, err = e.UpdateQuote("A", book.Quote{Seq: 3, Moment: 30, Price: math.MaxInt64})
+	must(err)
+	fmt.Println("seq3 等待: 条数", n, "缺口", e.HasGap("A"))
+
+	// 等待中的 seq3 以相同内容再次提交：成功但 0 条生效，不会重试整条链。
+	n, err = e.UpdateQuote("A", book.Quote{Seq: 3, Moment: 30, Price: math.MaxInt64})
+	must(err)
+	fmt.Println("等待报价同内容重提: 条数", n, "错误", err, "缺口", e.HasGap("A"))
+
+	// 补交缺失的序号 2：链 seq2@5 → seq3@MaxInt64 预检到 seq3 时，
+	// 2 份持仓的市值 2×MaxInt64 无法表示，整批拒绝：0 条生效、ErrInt64Overflow。
+	recsBefore := len(e.Records())
+	n, err = e.UpdateQuote("A", book.Quote{Seq: 2, Moment: 20, Price: 5})
+	fmt.Println("补交 seq2: 条数", n, "ErrInt64Overflow =", errors.Is(err, book.ErrInt64Overflow))
+	fmt.Println("错误:", err)
+
+	// 本次补交的 seq2 没有生效、也没有转入等待；此前等待的 seq3 保留第一次接收的
+	// 内容。最新报价、缺口、现金持仓与风险状态全部是提交前值，只多一条拒绝记录。
+	q, _ := e.CurrentQuote("A")
+	s = e.RiskStatus()
+	fmt.Println("整批拒绝后: 最新报价", q.Seq, q.Moment, q.Price, "缺口", e.HasGap("A"),
+		"现金", e.Cash(), "持仓", e.Position("A"))
+	fmt.Println("整批拒绝后: 基准", s.Baseline, "净值", s.Equity, "亏损", s.Loss, "限制", s.Restricted)
+	rj := e.Records()[recsBefore]
+	fmt.Println("仅新增记录数:", len(e.Records())-recsBefore, "类型:", rj.Kind, "原因:", rj.Reason)
+
+	// 等待中的序号不能就地改价或改时刻：内容冲突，原报价保留，状态不动。
+	_, err = e.UpdateQuote("A", book.Quote{Seq: 3, Moment: 30, Price: 4})
+	fmt.Println("等待序号改价:", err)
+	_, err = e.UpdateQuote("A", book.Quote{Seq: 3, Moment: 31, Price: math.MaxInt64})
+	fmt.Println("等待序号改时刻:", err)
+	q, _ = e.CurrentQuote("A")
+	fmt.Println("冲突后: 最新报价", q.Seq, "缺口", e.HasGap("A"), "现金", e.Cash(),
+		"持仓", e.Position("A"), "记录数", len(e.Records()))
+
+	// 缺口期间通过正常卖单卖出全部 2 份。卖单刚被接受、尚未成交时，持仓并不减少，
+	// 可卖数量被卖单占用为 0；现金也不预先增加。
+	sid, err := e.Sell("A", 2, 5)
+	must(err)
+	fmt.Println("卖单接受未成交: 持仓", e.Position("A"), "可卖", e.Sellable("A"), "现金", e.Cash())
+
+	// 成交回报记账后：现金 990+2×5=1000，持仓清零。改变持仓不会让行情自行推进，
+	// 缺口仍在、seq3 仍等待、最新报价仍是 seq1。
+	sellRes, err := e.Fill(book.Trade{TradeID: 2, OrderID: sid, Symbol: "A", Side: book.Sell, Price: 5, Qty: 2})
+	must(err)
+	fmt.Println("卖出成交: 本次", sellRes.Qty, "累计", sellRes.Filled, "剩余", sellRes.Remaining, sellRes.Status)
+	q, _ = e.CurrentQuote("A")
+	fmt.Println("卖出后: 现金", e.Cash(), "持仓", e.Position("A"), "缺口", e.HasGap("A"), "最新报价", q.Seq)
+
+	// 持仓清零后，seq3 的天价不再参与估值（无持仓不贡献市值），重新补交缺失的
+	// seq2：本次调用连续生效 seq2、seq3 两条，缺口消失。
+	n, err = e.UpdateQuote("A", book.Quote{Seq: 2, Moment: 20, Price: 5})
+	must(err)
+	fmt.Println("重新补交 seq2: 生效条数", n)
+	q, _ = e.CurrentQuote("A")
+	s = e.RiskStatus()
+	fmt.Println("最终: 最新报价", q.Seq, q.Moment, q.Price, "缺口", e.HasGap("A"),
+		"现金", e.Cash(), "持仓", e.Position("A"))
+	fmt.Println("最终: 净值", s.Equity, "亏损", s.Loss, "限制", s.Restricted)
+
+	// 此前的溢出拒绝记录原样保留，卖出与补齐都没有改写它。
+	for i, r := range e.Records() {
+		line := fmt.Sprintf("记录[%d] %s 订单=%d 成交=%d", i, r.Kind, r.OrderID, r.TradeID)
+		if r.Reason != "" {
+			line += " " + r.Reason
+		}
+		fmt.Println(line)
+	}
+}
+```
+
+输出：
+
+```text
+seq1 生效条数: 1
+买入成交: 本次 2 累计 2 剩余 0 全部成交
+现金 持仓: 990 2
+开日: 基准 1000 净值 1000 亏损 0 限制 false
+seq3 等待: 条数 0 缺口 true
+等待报价同内容重提: 条数 0 错误 <nil> 缺口 true
+补交 seq2: 条数 0 ErrInt64Overflow = true
+错误: 报价序号 3: 净值、亏损或持仓金额超出 int64 范围
+整批拒绝后: 最新报价 1 10 5 缺口 true 现金 990 持仓 2
+整批拒绝后: 基准 1000 净值 1000 亏损 0 限制 false
+仅新增记录数: 1 类型: 拒绝 原因: 报价序号 3 生效将使净值或亏损超出 int64 范围，整批拒绝
+等待序号改价: 等待中的报价序号 3 内容冲突: 已有 (时刻=30, 价格=9223372036854775807)，新值 (时刻=30, 价格=4)
+等待序号改时刻: 等待中的报价序号 3 内容冲突: 已有 (时刻=30, 价格=9223372036854775807)，新值 (时刻=31, 价格=9223372036854775807)
+冲突后: 最新报价 1 缺口 true 现金 990 持仓 2 记录数 3
+卖单接受未成交: 持仓 2 可卖 0 现金 990
+卖出成交: 本次 2 累计 2 剩余 0 全部成交
+卖出后: 现金 1000 持仓 0 缺口 true 最新报价 1
+重新补交 seq2: 生效条数 2
+最终: 最新报价 3 30 9223372036854775807 缺口 false 现金 1000 持仓 0
+最终: 净值 1000 亏损 0 限制 false
+记录[0] 接受 订单=1 成交=0
+记录[1] 成交 订单=1 成交=1
+记录[2] 拒绝 订单=0 成交=0 报价序号 3 生效将使净值或亏损超出 int64 范围，整批拒绝
+记录[3] 接受 订单=2 成交=0
+记录[4] 成交 订单=2 成交=2
+```
+
+补齐失败后要分清“谁还留着、怎么再用上”：
+
+- **本次补交的 seq2 没有留下任何痕迹**：它既未生效也未转入等待，序号 2 没有被
+  占用，因此后面用相同内容再次提交 seq2 是一次全新的补齐，而不是“改价重试”。
+  它能不能过，取决于**提交当时**的账户状态——第一次持仓 2、等待天价参与估值而
+  溢出；卖出后持仓 0，同一条 seq2 这次就连同 seq3 一起生效。
+- **此前等待的 seq3 全程只保留第一次接收的内容**（时刻 30、价格 MaxInt64）。
+  相同内容重提返回 0 条生效、错误为 `nil`，不会借这次提交重跑整条链；改价或改
+  时刻都返回冲突错误且不新增记录。最终链生效时，`CurrentQuote` 的时刻和高价正
+  是这条等待报价的原始内容——等待期间它没有被任何一次失败或重试改写。
+- **交易改变账户，但不推进行情**：卖单只被接受时持仓仍是 2（可卖被占用为 0），
+  不能当作持仓已减少；卖出 2 份成交后现金 1000、持仓 0，但缺口仍在、最新报价
+  仍是 seq1，必须再补一次 seq2，链才推进。
+- 整批拒绝只新增一条指出**出错序号 3** 的拒绝记录；此后的改价/改时刻冲突不新增
+  记录，卖出接受与成交各加自己的记录，但这条拒绝记录在最终输出里仍是记录 [2]，
+  原因和快照原样保留，不被后续卖出与补齐改写。
 
 ## 账户总持仓金额上限
 
