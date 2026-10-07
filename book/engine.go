@@ -789,31 +789,33 @@ func (e *Engine) placeOrder(symbol string, side Side, qty, limit int64) (int64, 
 
 	// 账户总持仓金额上限：新买单加入后合计不超过上限才可接受（恰好等于允许）。
 	// 原有现金、持仓限额与行情缺口规则均已通过后才检查此项。
+	// 申请后合计、超限与溢出判断与修改买单共用 checkAmountLimitLocked，同一条
+	// 金额上限规则只维护一处；新买单此前没有本单占用，旧占用按 0 处理。
 	if reason == "" && side == Buy && e.amtLimitSet {
-		t, ok := e.amountTotalsLocked()
-		if !ok {
-			r := fmt.Sprintf("账户总持仓金额计算超出 int64 范围，买单 %s %d 股限价 %d 整体拒绝",
-				symbol, qty, limit)
-			e.appendAmountRejectLocked(symbol, qty, limit, r, nil, 0, false)
-			return 0, fmt.Errorf("%s %s 委托被拒绝: %w", side, symbol, ErrInt64Overflow)
-		}
 		// 与修改买单、账户金额汇总共用同一单价口径 buyReservedUnit。
 		unit := buyReservedUnit(st.hasQuote, st.latest.Price, limit)
-		need, ok := mulPosInt64(qty, unit)
-		var apply int64
-		if ok {
-			apply, ok = addInt64(t.total, need)
-		}
-		if !ok {
-			r := fmt.Sprintf("账户总持仓金额申请后合计超出 int64 范围，买单 %s %d 股限价 %d 整体拒绝",
-				symbol, qty, limit)
-			e.appendAmountRejectLocked(symbol, qty, limit, r, &t, 0, false)
+		need, needOK := mulPosInt64(qty, unit)
+		check := e.checkAmountLimitLocked(0, need, needOK)
+		if check.overflow {
+			// 申请前合计仍可表示时，拒绝记录保留这份金额与报价快照；
+			// 申请前合计本身已越界时只固化启用状态与上限，不填入无效金额。
+			var r string
+			var t *amtTotals
+			if check.beforeOK {
+				r = fmt.Sprintf("账户总持仓金额申请后合计超出 int64 范围，买单 %s %d 股限价 %d 整体拒绝",
+					symbol, qty, limit)
+				t = &check.before
+			} else {
+				r = fmt.Sprintf("账户总持仓金额计算超出 int64 范围，买单 %s %d 股限价 %d 整体拒绝",
+					symbol, qty, limit)
+			}
+			e.appendAmountRejectLocked(symbol, qty, limit, r, t, 0, false)
 			return 0, fmt.Errorf("%s %s 委托被拒绝: %w", side, symbol, ErrInt64Overflow)
 		}
-		if apply > e.amtLimit {
+		if check.over {
 			r := fmt.Sprintf("超过账户总持仓金额上限 %d: 已持仓金额 %d + 有效买单剩余占用 %d + 本次按 max(限价,报价)=%d 计 %d，申请后合计 %d",
-				e.amtLimit, t.holding, t.reserved, unit, need, apply)
-			e.appendAmountRejectLocked(symbol, qty, limit, r, &t, apply, true)
+				e.amtLimit, check.before.holding, check.before.reserved, unit, need, check.apply)
+			e.appendAmountRejectLocked(symbol, qty, limit, r, &check.before, check.apply, true)
 			return 0, fmt.Errorf("%s %s 委托被拒绝: %s", side, symbol, r)
 		}
 	}
@@ -1290,28 +1292,26 @@ func (e *Engine) Modify(orderID, newQty, newLimit int64) error {
 
 	// 账户总持仓金额上限：修改前合计减去本订单旧占用、加上新占用后不得超过上限
 	// （恰好等于允许）；额度不足只拒绝本次修改，不撤销其他订单。
+	// 申请后合计、超限与溢出判断与接受新买单共用 checkAmountLimitLocked，同一条
+	// 金额上限规则只维护一处。
 	var before, apply amtTotals
 	amtOverLimit := false
 	if reason == "" && o.Side == Buy && e.amtLimitSet {
-		b, okb := e.amountTotalsLocked()
-		if !okb || (!needsComputed && !computeNeeds()) {
+		needsOK := needsComputed || computeNeeds()
+		check := e.checkAmountLimitLocked(oldAmtNeed, newAmtNeed, needsOK)
+		if check.overflow {
 			overflow = true
-			reason = fmt.Sprintf("订单 %d 修改后账户总持仓金额计算超出 int64 范围，修改拒绝", orderID)
-		} else {
-			base, ok1 := subInt64(b.total, oldAmtNeed)
-			aTotal, ok2 := addInt64(base, newAmtNeed)
-			if !ok1 || !ok2 {
-				overflow = true
-				reason = fmt.Sprintf("订单 %d 修改后账户总持仓金额申请后合计超出 int64 范围，修改拒绝", orderID)
+			if !needsOK || !check.beforeOK {
+				reason = fmt.Sprintf("订单 %d 修改后账户总持仓金额计算超出 int64 范围，修改拒绝", orderID)
 			} else {
-				before = b
-				apply.total = aTotal
-				if aTotal > e.amtLimit {
-					amtOverLimit = true
-					reason = fmt.Sprintf("修改后超过账户总持仓金额上限 %d: 修改前合计 %d，申请后合计 %d（原占用由新占用替代，不撤销其他订单）",
-						e.amtLimit, b.total, aTotal)
-				}
+				reason = fmt.Sprintf("订单 %d 修改后账户总持仓金额申请后合计超出 int64 范围，修改拒绝", orderID)
 			}
+		} else if check.over {
+			before = check.before
+			apply.total = check.apply
+			amtOverLimit = true
+			reason = fmt.Sprintf("修改后超过账户总持仓金额上限 %d: 修改前合计 %d，申请后合计 %d（原占用由新占用替代，不撤销其他订单）",
+				e.amtLimit, check.before.total, check.apply)
 		}
 	}
 
@@ -1420,6 +1420,55 @@ func checkPositionLimit(st *symbolState, replaceRemaining, applyRemaining int64)
 		return positionLimitCheck{used: used, overflow: true}
 	}
 	return positionLimitCheck{used: used, over: apply > st.maxPosition}
+}
+
+// ---------------------------------------------------------------------------
+// 账户总持仓金额上限的申请判断
+//
+// 同一条金额上限规则在接受新买单（Buy）与修改有效买单（Modify）两处共用，
+// 申请后合计、超限与溢出判断只在 checkAmountLimitLocked 维护：
+//
+//	申请后合计 = 申请前合计 − 本单旧占用 + 本次新占用
+//
+//   - 申请前合计按账户金额汇总口径：各合约持仓数量 × 最新已生效报价，加上有效
+//     买单剩余量 × max(限价, 最新报价)；等待补齐的报价不参与；
+//   - 新买单此前没有本单占用（oldNeed 传 0），本次新占用为
+//     申请数量 × max(限价, 最新报价)；
+//   - 修改买单以 新剩余量 × max(新限价, 最新报价) 的占用替换本单旧占用，其他
+//     订单与合约的金额保留；已成交数量只计入持仓，历史成交不随修改重新结算；
+//   - 申请后恰好等于上限允许，超过只拒绝当前申请，绝不撤销其他订单腾额度；
+//   - 任一步计算超出 int64 范围时只置 overflow，不回绕出伪合计；拒绝原因文案
+//     与记录快照的取舍（新买单在申请前合计可表示时保留金额快照，修改买单越界
+//     时只留启用状态与上限）仍由各自入口按原有规则决定。
+// ---------------------------------------------------------------------------
+
+// amountLimitCheck 是一次账户总持仓金额上限申请试算的结果。
+type amountLimitCheck struct {
+	before   amtTotals // 申请前金额快照；beforeOK 为 false 时未算出
+	beforeOK bool      // 申请前合计本身是否可表示（拒绝记录据此决定能否固化金额快照）
+	apply    int64     // 申请后合计（overflow 时无效）
+	overflow bool      // 申请前合计、占用金额或申请后合计计算超出 int64 范围；此时 over 无意义
+	over     bool      // 申请后合计超过上限；恰好等于不算超限
+}
+
+// checkAmountLimitLocked 按上述唯一的金额上限规则试算。oldNeed 为本单旧占用
+// （接受新买单时传 0），newNeed 为本次新占用；needsOK 为 false 表示调用方试算
+// 占用金额时已经溢出。合计可表示时再与 e.amtLimit 比较，恰好等于不算超限。
+// 调用时须持有引擎锁。
+func (e *Engine) checkAmountLimitLocked(oldNeed, newNeed int64, needsOK bool) amountLimitCheck {
+	before, ok := e.amountTotalsLocked()
+	if !ok {
+		return amountLimitCheck{overflow: true}
+	}
+	if !needsOK {
+		return amountLimitCheck{before: before, beforeOK: true, overflow: true}
+	}
+	base, ok1 := subInt64(before.total, oldNeed)
+	apply, ok2 := addInt64(base, newNeed)
+	if !ok1 || !ok2 {
+		return amountLimitCheck{before: before, beforeOK: true, overflow: true}
+	}
+	return amountLimitCheck{before: before, beforeOK: true, apply: apply, over: apply > e.amtLimit}
 }
 
 // amtRejectDetail 是账户总持仓金额上限拒绝记录要固化的金额快照，新买单与修改买单
