@@ -590,3 +590,275 @@ s := e.PositionAmountStatus()         // s.Enabled / Limit / Holding / BuyReserv
 链中任一步溢出时整批不生效，已生效报价、撤单、占用变化都不留下，原先等待的报价
 仍然保留。
 
+### 下调上限的撤单次序与历史金额：一次从 200 调到 76 的完整核对
+
+调用方把已设置的上限**调低**后，当前合计可能已经不超限，也可能仍然超限；收敛时从
+**编号最大的有效买单**起，每张都整单撤销**全部未成交部分**，每撤一张就按释放后的
+合计重新判断，一旦合计不再超限（**恰好等于上限也算不超限**）立即停止——绝不会只
+取消一张订单的一部分来凑数，也不会多撤更早的订单。`SetPositionAmountLimit` 返回
+本次实际撤销的订单编号，顺序与撤单先后一致。
+
+这里要分清两套金额，它们在本例中确实不同：
+
+- **现金占用**始终按**限价 × 剩余量**冻结，撤单释放的也是这份冻结；
+- **买单金额占用**按 **剩余量 × max(限价, 最新已生效报价)** 计入“持仓市值 +
+  买单金额占用”合计，限价低于报价的订单按报价计，因此同一张单释放的两份金额可能
+  不同。
+
+下例从创建账户开始，不开日内亏损保护：现金 1000；合约 A、B 持仓限额各 100，连续
+有效报价为 A 序号 1、时刻 10、价格 10，B 序号 1、时刻 20、价格 20。先设宽松上限
+200，再依次接受三张买单，并让编号居中的订单二先部分成交：
+
+- 订单一（A，限价 12 ＞报价 10）：总量 5，按 9 成交 2，剩余 3；
+- 订单二（B，限价 15 ＜报价 20）：总量 4，按 14 成交 1，剩余 3；
+- 订单三（A，限价 8 ＜报价 10）：总量 2，尚未成交，剩余 2。
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/descikazuyq/book-risk/book"
+)
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func main() {
+	// 创建账户：初始现金 1000，不开日内亏损保护（全程不调用 StartTradingDay）。
+	e, err := book.NewEngine(1000)
+	must(err)
+
+	// 两个合约都设置充足的持仓限额，并各给一条连续有效报价：
+	// A：序号 1、时刻 10、价格 10；B：序号 1、时刻 20、价格 20。
+	_, err = e.SetMaxPosition("A", 100)
+	must(err)
+	_, err = e.SetMaxPosition("B", 100)
+	must(err)
+	_, err = e.UpdateQuote("A", book.Quote{Seq: 1, Moment: 10, Price: 10})
+	must(err)
+	_, err = e.UpdateQuote("B", book.Quote{Seq: 1, Moment: 20, Price: 20})
+	must(err)
+
+	// 先设置一个宽松的账户总持仓金额上限 200：三张订单都放得下，无单可撤。
+	canceled, err := e.SetPositionAmountLimit(200)
+	must(err)
+	fmt.Println("首次设置上限 200，撤销编号:", canceled)
+
+	// 订单一：A 买 5 份、限价 12（高于 A 报价 10），随后只成交 2 份、成交价 9。
+	id1, err := e.Buy("A", 5, 12)
+	must(err)
+	res1, err := e.Fill(book.Trade{TradeID: 1, OrderID: id1, Symbol: "A", Side: book.Buy, Price: 9, Qty: 2})
+	must(err)
+	fmt.Println("订单一成交:", res1.Status, "本次", res1.Qty, "累计", res1.Filled, "剩余", res1.Remaining)
+
+	// 订单二：B 买 4 份、限价 15（低于 B 报价 20），随后只成交 1 份、成交价 14。
+	id2, err := e.Buy("B", 4, 15)
+	must(err)
+	res2, err := e.Fill(book.Trade{TradeID: 2, OrderID: id2, Symbol: "B", Side: book.Buy, Price: 14, Qty: 1})
+	must(err)
+	fmt.Println("订单二成交:", res2.Status, "本次", res2.Qty, "累计", res2.Filled, "剩余", res2.Remaining)
+
+	// 订单三：A 买 2 份、限价 8（低于 A 报价 10），尚未成交。
+	id3, err := e.Buy("A", 2, 8)
+	must(err)
+	fmt.Println("订单三接受，编号:", id3)
+
+	// ---- 下调前的资金与金额 ----
+	fmt.Println("下调前: 现金", e.Cash(), "占用现金", e.ReservedCash(), "可用", e.AvailableCash(),
+		"持仓A", e.Position("A"), "持仓B", e.Position("B"))
+	s := e.PositionAmountStatus()
+	fmt.Printf("下调前金额: 上限=%d 持仓市值=%d 买单金额占用=%d 合计=%d\n",
+		s.Limit, s.Holding, s.BuyReserved, s.Total)
+	for _, o := range e.Orders() {
+		fmt.Printf("下调前订单 %d: %s 限价=%d 总量=%d 已成交=%d 剩余=%d\n",
+			o.ID, o.Status, o.Limit, o.Qty, o.Filled, o.Remaining())
+	}
+
+	// 把上限从 200 调低到 76：编号最大的两张订单依次撤销全部未成交部分。
+	recsBefore := len(e.Records())
+	canceled, err = e.SetPositionAmountLimit(76)
+	must(err)
+	fmt.Println("下调到 76，返回撤销编号顺序:", canceled)
+
+	// ---- 操作结束后的订单与金额查询 ----
+	fmt.Println("操作结束后: 现金", e.Cash(), "占用现金", e.ReservedCash(), "可用", e.AvailableCash(),
+		"持仓A", e.Position("A"), "持仓B", e.Position("B"))
+	s = e.PositionAmountStatus()
+	fmt.Printf("操作结束后金额: 上限=%d 持仓市值=%d 买单金额占用=%d 合计=%d\n",
+		s.Limit, s.Holding, s.BuyReserved, s.Total)
+	for _, o := range e.Orders() {
+		fmt.Printf("操作结束后订单 %d: %s 限价=%d 总量=%d 已成交=%d 有效剩余=%d\n",
+			o.ID, o.Status, o.Limit, o.Qty, o.Filled, o.Remaining())
+	}
+
+	// ---- 本次新增的撤销记录 ----
+	for _, r := range e.Records()[recsBefore:] {
+		fmt.Printf("记录%s: 订单=%d 限价=%d 总量=%d 累计成交=%d 本次取消=%d 判断时 上限=%d 持仓=%d 买单占用=%d 合计=%d\n",
+			r.Kind, r.OrderID, r.Limit, r.Qty, r.Filled, r.Remaining,
+			r.AmtLimit, r.AmtHolding, r.AmtBuyReserved, r.AmtTotal)
+		for _, ref := range r.AmtQuoteRefs {
+			fmt.Printf("        报价定位: %s 序号=%d 时刻=%d 价格=%d\n", ref.Symbol, ref.Seq, ref.Moment, ref.Price)
+		}
+	}
+}
+```
+
+输出：
+
+```text
+首次设置上限 200，撤销编号: []
+订单一成交: 部分成交 本次 2 累计 2 剩余 3
+订单二成交: 部分成交 本次 1 累计 1 剩余 3
+订单三接受，编号: 3
+下调前: 现金 968 占用现金 97 可用 871 持仓A 2 持仓B 1
+下调前金额: 上限=200 持仓市值=40 买单金额占用=116 合计=156
+下调前订单 1: 部分成交 限价=12 总量=5 已成交=2 剩余=3
+下调前订单 2: 部分成交 限价=15 总量=4 已成交=1 剩余=3
+下调前订单 3: 待成交 限价=8 总量=2 已成交=0 剩余=2
+下调到 76，返回撤销编号顺序: [3 2]
+操作结束后: 现金 968 占用现金 36 可用 932 持仓A 2 持仓B 1
+操作结束后金额: 上限=76 持仓市值=40 买单金额占用=36 合计=76
+操作结束后订单 1: 部分成交 限价=12 总量=5 已成交=2 有效剩余=3
+操作结束后订单 2: 已撤销 限价=15 总量=4 已成交=1 有效剩余=0
+操作结束后订单 3: 已撤销 限价=8 总量=2 已成交=0 有效剩余=0
+记录撤销: 订单=3 限价=8 总量=2 累计成交=0 本次取消=2 判断时 上限=76 持仓=40 买单占用=116 合计=156
+        报价定位: A 序号=1 时刻=10 价格=10
+        报价定位: B 序号=1 时刻=20 价格=20
+记录撤销: 订单=2 限价=15 总量=4 累计成交=1 本次取消=3 判断时 上限=76 持仓=40 买单占用=96 合计=136
+        报价定位: A 序号=1 时刻=10 价格=10
+        报价定位: B 序号=1 时刻=20 价格=20
+```
+
+把“返回的撤销编号顺序、操作结束后的查询、本次新增的撤销记录”三者对齐，就能核对
+一次下调为何恰好撤掉这两张订单：
+
+1. **下调前**：成交按**成交价**结算，现金余额 968 = 1000−2×9−1×14；持仓 A 2 份、
+   B 1 份，市值 2×10+1×20 = **40**。买单金额占用 116 = 订单一 3×max(12,10)=36、
+   订单二 3×max(15,20)=**60**（限价 15 低于报价 20，按报价计）、订单三
+   2×max(8,10)=**20**（同理按报价 10 计），合计 **156** ≤ 200，所以设 200 时无单
+   可撤。现金占用另按限价冻结：36+45+16 = **97**，可用现金 871。
+2. **先撤编号最大的订单三**：撤销前合计 156 ＞ 76，整单取消其剩余 2 份。它的撤销
+   记录固化的是**撤销该单之前用于判断**的数值——持仓 40、买单占用 116、合计 156；
+   记录里的 `剩余=2` 是**本次取消的数量**。
+3. **再撤订单二**：后一条记录承接前一次撤销释放的金额占用 20，买单占用 116−20 =
+   **96**、合计 156−20 = **136**，仍 ＞ 76，于是只取消订单二未成交的 3 份、已成交
+   的 1 份保留；其记录固化撤销前的 40/96/136 与“本次取消 3”。
+4. **合计恰好等于上限即停止**：再释放订单二的金额占用 60 后，合计 136−60 = **76**，
+   与新上限相等，立即停止。编号最小的订单一保持部分成交、有效剩余 3 不动——引擎
+   不会为了凑数只取消某张订单的一部分，也不会在已经达标后继续撤订单一。
+5. **操作结束后的查询是最终值，不能当成每条历史记录的值**：`PositionAmountStatus`
+   查到持仓 40、买单占用 36（只剩订单一 3×12）、合计 **76**；而两条历史记录分别是
+   撤销前的 156 与 136，差额正是各自释放的买单金额占用。订单查询里订单二、订单三
+   `Remaining()` 为 **0**（已撤销订单没有有效剩余量），这与撤销记录中“本次取消
+   3 / 2”语义不同，不要混读。
+6. **估值依据可定位**：每条撤销记录都保存当时参与计算的合约报价——A 序号 1、时刻
+   10、价格 10，B 序号 1、时刻 20、价格 20（按合约代码排列各一条），事后报价再变
+   也不改写这些定位。
+7. **资金与持仓各发生了什么**：本次撤单只释放未成交部分的占用，**现金余额 968 与
+   已成交持仓 A2/B1 全部保留**，已成交数量也保留（订单二 `已成交=1`）。两份被释放
+   的金额按各自口径并不相同：现金占用释放 2×8+3×15 = **61**（97→36，全部按限价），
+   买单金额占用释放 20+60 = **80**（116→36，按限价与报价较高者）；可用现金随之
+   871→**932**。持仓不会因撤单而被卖出。
+
+### 两个直接相关的边界
+
+一是**负上限**：在任何撤单之前直接报错，原上限、三张订单、资金与持仓全部保留，不
+新增任何记录；二是**新上限低于持仓市值本身**：所有有效买单的剩余量都会被撤销，但
+持仓保留、不会自动卖出，最终合计仍可能高于上限，需要调用方自行卖出才能降到上限
+以内。下面的例子复用与上例“下调前”完全相同的状态（上限 200、合计 156）：
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/descikazuyq/book-risk/book"
+)
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+// newDemo 构造与主例“下调前”完全相同的状态：上限 200、三张买单、
+// 现金 968、持仓 A2/B1、合计 156。
+func newDemo() *book.Engine {
+	e, _ := book.NewEngine(1000)
+	_, _ = e.SetMaxPosition("A", 100)
+	_, _ = e.SetMaxPosition("B", 100)
+	_, _ = e.UpdateQuote("A", book.Quote{Seq: 1, Moment: 10, Price: 10})
+	_, _ = e.UpdateQuote("B", book.Quote{Seq: 1, Moment: 20, Price: 20})
+	_, _ = e.SetPositionAmountLimit(200)
+	id1, _ := e.Buy("A", 5, 12)
+	_, _ = e.Fill(book.Trade{TradeID: 1, OrderID: id1, Symbol: "A", Side: book.Buy, Price: 9, Qty: 2})
+	id2, _ := e.Buy("B", 4, 15)
+	_, _ = e.Fill(book.Trade{TradeID: 2, OrderID: id2, Symbol: "B", Side: book.Buy, Price: 14, Qty: 1})
+	_, _ = e.Buy("A", 2, 8)
+	return e
+}
+
+func main() {
+	// 边界一：负上限报错，原设置与订单保留，不新增记录。
+	e := newDemo()
+	before := len(e.Records())
+	canceled, err := e.SetPositionAmountLimit(-1)
+	fmt.Println("负上限错误:", err)
+	fmt.Println("撤销编号:", canceled, "新增记录数:", len(e.Records())-before)
+	st := e.PositionAmountStatus()
+	fmt.Println("原设置保留:", st.Limit, st.Holding, st.BuyReserved, st.Total)
+	fmt.Println("现金/占用/可用:", e.Cash(), e.ReservedCash(), e.AvailableCash(),
+		"持仓A/B:", e.Position("A"), e.Position("B"))
+
+	// 边界二：新上限 39 低于持仓市值 40 本身。
+	e2 := newDemo()
+	before2 := len(e2.Records())
+	got, err := e2.SetPositionAmountLimit(39)
+	must(err)
+	fmt.Println("低于持仓市值，撤销编号:", got, "新增记录数:", len(e2.Records())-before2)
+	st2 := e2.PositionAmountStatus()
+	fmt.Println("撤后金额:", st2.Limit, st2.Holding, st2.BuyReserved, st2.Total)
+	fmt.Println("现金/占用/可用:", e2.Cash(), e2.ReservedCash(), e2.AvailableCash(),
+		"持仓A/B:", e2.Position("A"), e2.Position("B"))
+	for _, o := range e2.Orders() {
+		fmt.Printf("订单 %d: %s 已成交=%d 有效剩余=%d\n", o.ID, o.Status, o.Filled, o.Remaining())
+	}
+	for _, r := range e2.Records()[before2:] {
+		fmt.Printf("记录%s: 订单=%d 累计成交=%d 本次取消=%d 判断时 持仓=%d 买单占用=%d 合计=%d\n",
+			r.Kind, r.OrderID, r.Filled, r.Remaining, r.AmtHolding, r.AmtBuyReserved, r.AmtTotal)
+	}
+}
+```
+
+输出：
+
+```text
+负上限错误: 账户总持仓金额上限不能为负: -1
+撤销编号: [] 新增记录数: 0
+原设置保留: 200 40 116 156
+现金/占用/可用: 968 97 871 持仓A/B: 2 1
+低于持仓市值，撤销编号: [3 2 1] 新增记录数: 3
+撤后金额: 39 40 0 40
+现金/占用/可用: 968 0 968 持仓A/B: 2 1
+订单 1: 已撤销 已成交=2 有效剩余=0
+订单 2: 已撤销 已成交=1 有效剩余=0
+订单 3: 已撤销 已成交=0 有效剩余=0
+记录撤销: 订单=3 累计成交=0 本次取消=2 判断时 持仓=40 买单占用=116 合计=156
+记录撤销: 订单=2 累计成交=1 本次取消=3 判断时 持仓=40 买单占用=96 合计=136
+记录撤销: 订单=1 累计成交=2 本次取消=3 判断时 持仓=40 买单占用=36 合计=76
+```
+
+- **负上限**：错误先于任何状态变化返回，撤销编号为空、记录一条不增；上限仍是 200，
+  合计仍是 156，三张订单、现金 968/占用 97、持仓 A2/B1 全部维持原值。
+- **新上限 39 低于持仓市值 40**：三张有效买单的剩余量按编号从大到小全部撤销
+  （返回 `[3 2 1]`，三条记录的判断合计仍逐张承接：156→136→76，撤销原因注明“仅
+  持仓金额已超过上限”）。撤销后买单金额占用为 0、合计停在 **40**——它等于持仓市值，
+  仍然高于上限 39，但引擎**只撤买单、不自动卖出持仓**：现金 968、持仓 A2/B1 保留，
+  可用现金回升到 968。要把合计压到 39 以内，只能由调用方正常提交卖单并成交。
+
