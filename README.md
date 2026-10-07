@@ -773,3 +773,182 @@ func main() {
   也到此为止——**持仓保留，不会自动卖出**；撤单原因会写明“仅持仓金额已超过
   上限”。之后要降持仓只能正常提交卖单并成交。
 
+### 部分成交买单修改被金额上限拒绝：订单、资金与拒绝记录各自表示什么
+
+修改有效买单时，金额上限按“**旧占用由新占用替换**”的口径试算：申请后合计 =
+当前合计 − 本单旧占用（旧剩余量 × max(旧限价, 最新报价)）+ 本次新占用
+（新剩余量 × max(新限价, 最新报价)）。超过上限时**只拒绝本次修改**——不撤销
+其他订单腾额度，订单、资金、持仓与各项占用全部保留原值，只留下一条保存申请
+参数与判断快照的拒绝记录。下面的完整示例从创建账户开始走一遍，把这条规则与
+实际查询结果一一对应。
+
+场景安排：初始现金 2000，A、B 的最大持仓量都是 100，首条报价分别为
+A 序号1@15（时刻 10）、B 序号1@20（时刻 20），账户金额上限 260；不启用日内
+亏损保护，行情没有缺口。先接受 A 总量 10、限价 12 的买单并按成交价 11 买入
+其中 4 份，再接受 B 数量 3、限价 18 的买单。此时：
+
+- **现金余额 1956** = 2000 − 4×11：只有实际成交按**成交价**扣减现金；
+- **现金占用 126** = 6×12 + 3×18：未成交部分按**限价**冻结（A 剩余 6 份、
+  B 全部 3 份）；
+- **账户金额合计 210** = 持仓市值 60 + 买单金额占用 150：已持仓 4 份按**报价**
+  估值（4×15）；未成交买单按**限价与报价较高者**占用（6×max(12,15)=90，
+  3×max(18,20)=60）。已成交的 4 份只计入持仓，不能再算作 A 单的剩余量。
+
+随后把 A 单申请改为总量 12、限价 20：新剩余量 8、新占用 8×max(20,15)=160，
+申请后合计 = 210 − 90 + 160 = **280 > 260**，被拒绝。注意此时现金额度
+（新占用 160 远低于可用现金）与合约数量额度（4+8=12 ≤ 100）都充足，也只能
+拒绝这次修改，**不会撤销 B 的订单腾出额度**。再把同一订单申请改为总量 11、
+限价 20：新剩余量 7、新占用 7×20=140，申请后合计 = 210 − 90 + 140 = **260**
+恰好等于上限，允许成功；已成交的 4 份不重新结算，B 的订单继续有效。
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/descikazuyq/book-risk/book"
+)
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func main() {
+	e, err := book.NewEngine(2000) // 创建账户：初始现金 2000
+	must(err)
+	_, err = e.SetMaxPosition("A", 100) // 两个合约都给足持仓限额
+	must(err)
+	_, err = e.SetMaxPosition("B", 100)
+	must(err)
+
+	// 两个合约的连续有效报价：A 序号1@15（时刻10），B 序号1@20（时刻20）。
+	// 不开启日内亏损保护，行情没有缺口。
+	_, err = e.UpdateQuote("A", book.Quote{Seq: 1, Moment: 10, Price: 15})
+	must(err)
+	_, err = e.UpdateQuote("B", book.Quote{Seq: 1, Moment: 20, Price: 20})
+	must(err)
+
+	// 账户总持仓金额上限 260。
+	_, err = e.SetPositionAmountLimit(260)
+	must(err)
+
+	// 订单一：A 总量 10、限价 12 的买单；按成交价 11 买入其中 4 份。
+	idA, err := e.Buy("A", 10, 12)
+	must(err)
+	_, err = e.Fill(book.Trade{TradeID: 1, OrderID: idA, Symbol: "A", Side: book.Buy, Price: 11, Qty: 4})
+	must(err)
+
+	// 订单二：B 数量 3、限价 18 的买单。
+	idB, err := e.Buy("B", 3, 18)
+	must(err)
+	fmt.Println("订单编号: A单", idA, "B单", idB)
+
+	// ---- 修改前的账实 ----
+	st := e.PositionAmountStatus()
+	fmt.Println("修改前: 现金", e.Cash(), "占用现金", e.ReservedCash(), "可用现金", e.AvailableCash())
+	fmt.Println("修改前: 持仓 A", e.Position("A"), "B", e.Position("B"))
+	fmt.Println("修改前: 上限", st.Limit, "持仓市值", st.Holding, "买单金额占用", st.BuyReserved, "合计", st.Total)
+
+	// ---- 第一次修改申请：A 单改为总量 12、限价 20，超限被拒绝 ----
+	recsBefore := len(e.Records())
+	err = e.Modify(idA, 12, 20)
+	fmt.Println("修改 A 为 总量12 限价20:", err)
+
+	// 修改失败后查询：订单、资金、持仓与两张订单的占用全部保留原值。
+	oA, _ := e.Order(idA)
+	oB, _ := e.Order(idB)
+	fmt.Printf("拒绝后: A单 %s 总量 %d 限价 %d 已成交 %d 有效剩余量 %d\n",
+		oA.Status, oA.Qty, oA.Limit, oA.Filled, oA.Remaining())
+	fmt.Printf("拒绝后: B单 %s 总量 %d 限价 %d 已成交 %d 有效剩余量 %d\n",
+		oB.Status, oB.Qty, oB.Limit, oB.Filled, oB.Remaining())
+	st = e.PositionAmountStatus()
+	fmt.Println("拒绝后: 现金", e.Cash(), "占用现金", e.ReservedCash())
+	fmt.Println("拒绝后: 持仓市值", st.Holding, "买单金额占用", st.BuyReserved, "合计", st.Total)
+
+	// ---- 本次新增的拒绝记录：保存的是申请参数与判断时的金额快照 ----
+	for _, r := range e.Records()[recsBefore:] {
+		fmt.Printf("记录: %s 订单=%d 申请总量=%d 申请限价=%d 上限=%d 持仓市值=%d 买单金额占用=%d 修改前合计=%d 申请后合计=%d\n",
+			r.Kind, r.OrderID, r.Qty, r.Limit, r.AmtLimit, r.AmtHolding, r.AmtBuyReserved, r.AmtTotal, r.AmtApplyTotal)
+		for _, ref := range r.AmtQuoteRefs {
+			fmt.Printf("  参与报价: 合约 %s 序号 %d 时刻 %d 价格 %d\n", ref.Symbol, ref.Seq, ref.Moment, ref.Price)
+		}
+		fmt.Println("  原因:", r.Reason)
+	}
+
+	// ---- 第二次修改申请：A 单改为总量 11、限价 20，申请后合计恰好 260，成功 ----
+	err = e.Modify(idA, 11, 20)
+	must(err)
+	fmt.Println("修改 A 为 总量11 限价20: 成功")
+
+	oA, _ = e.Order(idA)
+	oB, _ = e.Order(idB)
+	fmt.Printf("成功后: A单 %s 总量 %d 限价 %d 已成交 %d 有效剩余量 %d\n",
+		oA.Status, oA.Qty, oA.Limit, oA.Filled, oA.Remaining())
+	fmt.Printf("成功后: B单 %s 总量 %d 限价 %d 已成交 %d 有效剩余量 %d\n",
+		oB.Status, oB.Qty, oB.Limit, oB.Filled, oB.Remaining())
+	st = e.PositionAmountStatus()
+	fmt.Println("成功后: 现金", e.Cash(), "占用现金", e.ReservedCash())
+	fmt.Println("成功后: 持仓市值", st.Holding, "买单金额占用", st.BuyReserved, "合计", st.Total)
+
+	// 成功修改的记录与前一条拒绝记录对照：记录保存各自时点的事实。
+	for _, r := range e.Records()[recsBefore:] {
+		if r.Kind == book.RecordModified {
+			fmt.Printf("记录: %s 订单=%d 旧总量=%d 旧限价=%d 新总量=%d 新限价=%d 已成交=%d 剩余=%d\n",
+				r.Kind, r.OrderID, r.OldQty, r.OldLimit, r.Qty, r.Limit, r.Filled, r.Remaining)
+		}
+	}
+	fmt.Println("旧拒绝记录仍在:", e.Records()[recsBefore].Kind, e.Records()[recsBefore].Reason)
+}
+```
+
+输出：
+
+```text
+订单编号: A单 1 B单 2
+修改前: 现金 1956 占用现金 126 可用现金 1830
+修改前: 持仓 A 4 B 0
+修改前: 上限 260 持仓市值 60 买单金额占用 150 合计 210
+修改 A 为 总量12 限价20: 修改订单 1 被拒绝: 修改后超过账户总持仓金额上限 260: 修改前合计 210，申请后合计 280（原占用由新占用替代，不撤销其他订单）
+拒绝后: A单 部分成交 总量 10 限价 12 已成交 4 有效剩余量 6
+拒绝后: B单 待成交 总量 3 限价 18 已成交 0 有效剩余量 3
+拒绝后: 现金 1956 占用现金 126
+拒绝后: 持仓市值 60 买单金额占用 150 合计 210
+记录: 拒绝 订单=1 申请总量=12 申请限价=20 上限=260 持仓市值=60 买单金额占用=150 修改前合计=210 申请后合计=280
+  参与报价: 合约 A 序号 1 时刻 10 价格 15
+  参与报价: 合约 B 序号 1 时刻 20 价格 20
+  原因: 修改后超过账户总持仓金额上限 260: 修改前合计 210，申请后合计 280（原占用由新占用替代，不撤销其他订单）
+修改 A 为 总量11 限价20: 成功
+成功后: A单 部分成交 总量 11 限价 20 已成交 4 有效剩余量 7
+成功后: B单 待成交 总量 3 限价 18 已成交 0 有效剩余量 3
+成功后: 现金 1956 占用现金 194
+成功后: 持仓市值 60 买单金额占用 200 合计 260
+记录: 修改 订单=1 旧总量=10 旧限价=12 新总量=11 新限价=20 已成交=4 剩余=7
+旧拒绝记录仍在: 拒绝 修改后超过账户总持仓金额上限 260: 修改前合计 210，申请后合计 280（原占用由新占用替代，不撤销其他订单）
+```
+
+对照输出逐项核对：
+
+- **修改失败时订单、资金、记录各自表示什么**：`Modify` 返回错误后，订单查询
+  显示 A 单仍是**原总量 10、原限价 12、已成交 4 份**（部分成交、有效剩余量
+  6），B 单原样有效；现金余额 1956、占用现金 126、持仓市值 60、买单金额占用
+  150、合计 210 全部与修改前相同——拒绝不留任何资金或占用痕迹。唯一的变化
+  是多了一条 `RecordRejected`：它的 `Qty`/`Limit` 保存的是**申请参数**
+  （总量 12、限价 20，不是订单当前参数），金额明细中 `AmtTotal=210` 是**修改
+  前合计**、`AmtApplyTotal=280` 是**申请后合计**；`AmtQuoteRefs` 里参与计算
+  的报价来自当时的 A（序号 1、时刻 10、价格 15）与 B（序号 1、时刻 20、价格
+  20）——是估值所用的**最新已生效报价**，而不是两笔委托的限价 12 与 18。
+- **“旧占用由新占用替换”如何对应到数字**：申请后合计 280 = 修改前合计 210
+  − 本单旧占用 90（6×max(12,15)）+ 本次新占用 160（8×max(20,15)）；B 单的
+  占用 60 与持仓市值 60 原样计入，不被撤销、不被重算。第二次申请的新占用为
+  7×20=140，申请后合计 210 − 90 + 140 = 260 恰好等于上限，允许成功。
+- **成功后的查询与旧记录对照**：A 单变为总量 11、限价 20、有效剩余量 7，
+  已成交 4 份保留且**不重新结算**（现金仍是 1956，不按新限价补扣）；占用现金
+  126→194（释放旧占用 6×12=72，冻结新占用 7×20=140），买单金额占用
+  150→200，合计恰好 260；B 单继续有效。`RecordModified` 记录同时保存修改前
+  参数（旧总量 10、旧限价 12）与修改后参数。而此时再读那条旧的拒绝记录，它
+  仍保存失败时的事实——申请总量 12、申请后合计 280：当前订单已经变化，历史
+  记录不会被改写，两者各自回答“现在是什么”和“当时发生了什么”。
+
