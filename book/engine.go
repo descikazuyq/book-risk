@@ -2077,7 +2077,10 @@ func (e *Engine) amountTotalsShadowLocked(quoteSym string, quote Quote, canceled
 // 首次设置与每次调整后都立即按当前状态收敛超限（见包注释），返回本次被撤销的
 // 订单编号（按撤销顺序）；负值报错并保留原设置；同值重复设置为无操作。
 // 金额乘积或合计溢出 int64 时整体报错（包装 ErrInt64Overflow）：本次设置不生效、
-// 原设置保留，只增加一条拒绝记录。
+// 原设置保留，只增加一条拒绝记录。金额占用与日内净值是两种口径，金额口径越界
+// 不影响净值记录：拒绝记录与其他开日后的拒绝一致，固化当时完整的日内风险快照
+// （日号、基准净值、当前净值、亏损、亏损上限与是否已限制增险）；未开日时该
+// 快照保持零值，失败也不会自动开日。
 func (e *Engine) SetPositionAmountLimit(limit int64) ([]int64, error) {
 	if limit < 0 {
 		return nil, fmt.Errorf("账户总持仓金额上限不能为负: %d", limit)
@@ -2090,13 +2093,17 @@ func (e *Engine) SetPositionAmountLimit(limit int64) ([]int64, error) {
 	}
 
 	// 先在当前状态上试算：溢出则设置不生效，保留原设置。
+	// 拒绝记录经 appendRecord 追加：开日时同时固化当时的日内风险快照
+	// （日号、基准净值、当前净值、亏损、上限与是否已限制增险），与开日后的
+	// 其他拒绝记录保持一致；金额口径越界不影响净值口径，净值此时必然可表示。
+	// 未开日时风险快照保持零值，也不会因本次失败自动开日。
 	if _, ok := e.amountTotalsLocked(); !ok {
-		e.records = append(e.records, Record{
+		e.appendRecord(Record{
 			Kind:       RecordRejected,
 			Reason:     fmt.Sprintf("设置账户总持仓金额上限为 %d 失败: %v", limit, ErrInt64Overflow),
 			AmtEnabled: e.amtLimitSet,
 			AmtLimit:   e.amtLimit,
-		})
+		}, nil)
 		return nil, fmt.Errorf("设置账户总持仓金额上限 %d: %w", limit, ErrInt64Overflow)
 	}
 
