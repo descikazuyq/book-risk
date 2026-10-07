@@ -526,43 +526,48 @@ func (e *Engine) SetMaxPosition(symbol string, max int64) ([]int64, error) {
 	st.maxSet = true
 	st.maxPosition = max
 
+	// “持仓本身已超限”与“持仓加有效买单剩余才超限”共用同一套有效买单判断
+	// （lastActivePositionBuyLocked）、原先的接受次序与同一个撤单循环：
+	// 每张订单都在选择当时重新判断是否仍可撤销，每次撤销其全部剩余量。
+	//   - 持仓本身已超过新限额：持续撤到该合约没有有效买单为止，持仓继续保留、
+	//     不自动平仓（st.position 不随撤单变化，故 holdingOver 只判定一次）；
+	//   - 普通超限：在 持仓 + 有效买单剩余量 <= 新限额 后即停止，恰好等于时
+	//     保留较早接受的订单。
+	holdingOver := st.position > max
+
 	var canceled []int64
-
-	if st.position > max {
-		// 持仓本身已超限：撤掉全部未成交买单，不自动平仓。
-		for i := len(st.buyOrderIDs) - 1; i >= 0 && st.reservedBuy > 0; i-- {
-			o := e.orders[st.buyOrderIDs[i]]
-			if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
-				continue
-			}
-			if o.Remaining() > 0 {
-				e.cancelLocked(o, fmt.Sprintf("持仓 %d 已超过新限额 %d，撤销剩余买单", st.position, max))
-				canceled = append(canceled, o.ID)
-			}
-		}
-		return canceled, nil
-	}
-
-	// 从最后接受的买单开始撤销，直到 持仓 + 买单剩余量 <= 新限额。
-	for st.position+st.reservedBuy > max {
-		var target *Order
-		for i := len(st.buyOrderIDs) - 1; i >= 0; i-- {
-			o := e.orders[st.buyOrderIDs[i]]
-			if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
-				continue
-			}
-			if o.Remaining() > 0 {
-				target = o
-				break
-			}
-		}
+	for holdingOver || st.position+st.reservedBuy > max {
+		target := e.lastActivePositionBuyLocked(st)
 		if target == nil {
-			break // 理论上不会发生：reservedBuy 与剩余买单不一致时兜底
+			break // 无有效买单可撤（reservedBuy 已为 0）时兜底结束
 		}
-		e.cancelLocked(target, fmt.Sprintf("持仓限额下调至 %d，撤销最后接受的剩余买单", max))
+		if holdingOver {
+			e.cancelLocked(target, fmt.Sprintf("持仓 %d 已超过新限额 %d，撤销剩余买单", st.position, max))
+		} else {
+			e.cancelLocked(target, fmt.Sprintf("持仓限额下调至 %d，撤销最后接受的剩余买单", max))
+		}
 		canceled = append(canceled, target.ID)
 	}
 	return canceled, nil
+}
+
+// lastActivePositionBuyLocked 是合约持仓限额下调撤单时唯一的有效买单选择规则：
+// 在该合约的买单接受序列 st.buyOrderIDs（最早接受在前）上自后向前，返回最后接受
+// 的一张仍有未成交部分的买单。不存在、已全部成交或已撤销的订单一律跳过。
+// 其他合约的买单与该合约的卖单不在本合约的接受序列中，永远不会被选中；成功修改过
+// 总量或限价的订单仍按最初接受的位置参与，修改不视为重新下单。调用方每撤一张后
+// 都应重新调用，以按撤销当时的状态判断后续订单是否仍可撤销。调用时须持有引擎锁。
+func (e *Engine) lastActivePositionBuyLocked(st *symbolState) *Order {
+	for i := len(st.buyOrderIDs) - 1; i >= 0; i-- {
+		o := e.orders[st.buyOrderIDs[i]]
+		if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
+			continue
+		}
+		if o.Remaining() > 0 {
+			return o
+		}
+	}
+	return nil
 }
 
 // UpdateQuote 提交合约报价。只有连续序号才能推进最新报价：
