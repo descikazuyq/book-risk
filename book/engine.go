@@ -2090,13 +2090,17 @@ func (e *Engine) SetPositionAmountLimit(limit int64) ([]int64, error) {
 	}
 
 	// 先在当前状态上试算：溢出则设置不生效，保留原设置。
+	// 拒绝记录经 appendRecord 统一固化快照：金额占用越界不影响日内净值口径，
+	// 已开日时仍须保留当时的日号、基准净值、当前净值、亏损、上限与限制状态，
+	// 与开日后的其他拒绝记录一致；未开日时风险快照保持零值，不自动开日。
+	// 金额上限启用状态与上限值按调用前口径保留，申请值只出现在原因文案中。
 	if _, ok := e.amountTotalsLocked(); !ok {
-		e.records = append(e.records, Record{
+		e.appendRecord(Record{
 			Kind:       RecordRejected,
 			Reason:     fmt.Sprintf("设置账户总持仓金额上限为 %d 失败: %v", limit, ErrInt64Overflow),
 			AmtEnabled: e.amtLimitSet,
 			AmtLimit:   e.amtLimit,
-		})
+		}, nil)
 		return nil, fmt.Errorf("设置账户总持仓金额上限 %d: %w", limit, ErrInt64Overflow)
 	}
 

@@ -500,6 +500,119 @@ func TestAmountOverflowOnSetKeepsOldSetting(t *testing.T) {
 	}
 }
 
+func TestAmountOverflowOnSetKeepsRiskSnapshot(t *testing.T) {
+	// 金额占用与日内净值是两种口径：设置金额上限因金额合计溢出被拒时，
+	// 拒绝记录仍须保留当时的完整日内风险快照，与开日后的其他拒绝记录一致。
+	e, _ := NewEngine(1000)
+	mustSetMax(t, e, "A", 100)
+	mustSetMax(t, e, "B", 100)
+	mustQuote(t, e, "A", Quote{Seq: 1, Moment: 1, Price: 10}, 1)
+	mustQuote(t, e, "B", Quote{Seq: 1, Moment: 1, Price: math.MaxInt64}, 1)
+	aID := mustBuy(t, e, "A", 10, 10)
+	if _, err := e.Fill(Trade{TradeID: 1, OrderID: aID, Symbol: "A", Side: Buy, Price: 10, Qty: 10}); err != nil {
+		t.Fatal(err)
+	}
+	// 开日 7、亏损上限 100：基准净值 = 现金 900 + 持仓 10×10 = 1000。
+	if err := e.StartTradingDay(7, 100); err != nil {
+		t.Fatal(err)
+	}
+	// A 跌到 9：净值 990，亏损 10，尚未限制增险。
+	mustQuote(t, e, "A", Quote{Seq: 2, Moment: 2, Price: 9}, 1)
+	if st := e.RiskStatus(); !st.Open || st.Day != 7 || st.Baseline != 1000 ||
+		st.Equity != 990 || st.Loss != 10 || st.LossLimit != 100 || st.Restricted {
+		t.Fatalf("前置风险状态错误: %+v", st)
+	}
+	// 未启用金额上限时接受 B 的买单：只占用 2 现金，不改变净值；
+	// 其金额占用 2 × max(1, MaxInt64) 无法表示。
+	bID := mustBuy(t, e, "B", 2, 1)
+
+	before := len(e.Records())
+	canceled, err := e.SetPositionAmountLimit(100)
+	if !errors.Is(err, ErrInt64Overflow) {
+		t.Fatalf("金额占用溢出必须返回包装 ErrInt64Overflow 的错误，实际 %v", err)
+	}
+	if canceled != nil {
+		t.Fatalf("溢出设置不得撤单: %v", canceled)
+	}
+
+	// 只新增一条拒绝记录，且携带开日时的完整风险快照。
+	if len(e.Records()) != before+1 {
+		t.Fatalf("溢出设置只能增加一条记录: %d -> %d", before, len(e.Records()))
+	}
+	rec := e.Records()[before]
+	if rec.Kind != RecordRejected {
+		t.Fatalf("新增记录必须是拒绝: %+v", rec)
+	}
+	if rec.RiskDay != 7 || rec.RiskBaseline != 1000 || rec.RiskEquity != 990 ||
+		rec.RiskLoss != 10 || rec.RiskLimit != 100 || rec.RiskRestrict {
+		t.Fatalf("拒绝记录必须保留拒绝发生时的日内风险快照: %+v", rec)
+	}
+	// 金额上限启用状态与上限值保留调用前口径（未启用、零值），申请值只在原因中。
+	if rec.AmtEnabled || rec.AmtLimit != 0 {
+		t.Fatalf("记录中的金额上限状态必须保留调用前口径: %+v", rec)
+	}
+	if !strings.Contains(rec.Reason, "100") {
+		t.Fatalf("拒绝原因必须说明申请值与金额越界: %q", rec.Reason)
+	}
+
+	// 整体不生效：不启用上限，现金、持仓、订单与占用均保持调用前状态。
+	if st := e.PositionAmountStatus(); st.Enabled {
+		t.Fatalf("溢出后设置不得生效: %+v", st)
+	}
+	if e.Cash() != 900 || e.ReservedCash() != 2 || e.Position("A") != 10 {
+		t.Fatalf("现金、占用与持仓必须保持调用前状态: cash=%d reserved=%d pos=%d",
+			e.Cash(), e.ReservedCash(), e.Position("A"))
+	}
+	if o, _ := e.Order(bID); o.Status != StatusPending || o.Remaining() != 2 {
+		t.Fatalf("B 买单必须保持待成交: %+v", o)
+	}
+	if st := e.RiskStatus(); st.Restricted {
+		t.Fatalf("溢出设置不得触发限制: %+v", st)
+	}
+
+	// 后续报价、亏损上限调整与开启新交易日不得改写已保存的拒绝记录。
+	mustQuote(t, e, "A", Quote{Seq: 3, Moment: 3, Price: 8}, 1)
+	if err := e.SetLossLimit(50); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.StartTradingDay(8, 1000); err != nil {
+		t.Fatal(err)
+	}
+	again := e.Records()[before]
+	if again.RiskDay != 7 || again.RiskBaseline != 1000 || again.RiskEquity != 990 ||
+		again.RiskLoss != 10 || again.RiskLimit != 100 || again.RiskRestrict {
+		t.Fatalf("已保存的拒绝记录不得被后续变化改写: %+v", again)
+	}
+}
+
+func TestAmountOverflowOnSetWithoutDayKeepsZeroRiskSnapshot(t *testing.T) {
+	// 未开日时同类失败继续保留零值风险快照，不自动开日。
+	e, _ := NewEngine(1_000_000)
+	mustSetMax(t, e, "A", 10)
+	mustQuote(t, e, "A", Quote{Seq: 1, Moment: 1, Price: 10}, 1)
+	id := mustBuy(t, e, "A", 3, 10)
+	if _, err := e.Fill(Trade{TradeID: 1, OrderID: id, Symbol: "A", Side: Buy, Price: 10, Qty: 3}); err != nil {
+		t.Fatal(err)
+	}
+	mustQuote(t, e, "A", Quote{Seq: 2, Moment: 2, Price: math.MaxInt64}, 1) // 3×MaxInt64 溢出
+
+	before := len(e.Records())
+	if _, err := e.SetPositionAmountLimit(100); !errors.Is(err, ErrInt64Overflow) {
+		t.Fatalf("设置时金额溢出必须返回 ErrInt64Overflow，实际 %v", err)
+	}
+	if len(e.Records()) != before+1 {
+		t.Fatalf("溢出设置只能增加一条记录: %d -> %d", before, len(e.Records()))
+	}
+	rec := e.Records()[before]
+	if rec.Kind != RecordRejected || rec.RiskDay != 0 || rec.RiskBaseline != 0 ||
+		rec.RiskEquity != 0 || rec.RiskLoss != 0 || rec.RiskLimit != 0 || rec.RiskRestrict {
+		t.Fatalf("未开日时风险快照必须保持零值: %+v", rec)
+	}
+	if st := e.RiskStatus(); st.Open {
+		t.Fatalf("溢出设置不得自动开日: %+v", st)
+	}
+}
+
 func TestAmountOverflowQuoteBatchRollsBack(t *testing.T) {
 	e, _ := NewEngine(1_000_000)
 	mustSetMax(t, e, "A", 10)
