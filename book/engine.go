@@ -526,43 +526,57 @@ func (e *Engine) SetMaxPosition(symbol string, max int64) ([]int64, error) {
 	st.maxSet = true
 	st.maxPosition = max
 
-	var canceled []int64
+	return e.enforcePositionLimitLocked(st, max), nil
+}
 
-	if st.position > max {
-		// 持仓本身已超限：撤掉全部未成交买单，不自动平仓。
-		for i := len(st.buyOrderIDs) - 1; i >= 0 && st.reservedBuy > 0; i-- {
-			o := e.orders[st.buyOrderIDs[i]]
-			if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
-				continue
-			}
-			if o.Remaining() > 0 {
-				e.cancelLocked(o, fmt.Sprintf("持仓 %d 已超过新限额 %d，撤销剩余买单", st.position, max))
-				canceled = append(canceled, o.ID)
-			}
+// lastActiveBuyLocked 返回该合约按接受次序最后一张仍有未成交部分的买单；
+// 其他合约的买单与该合约的卖单不在 st.buyOrderIDs 中，已全部成交或已撤销的
+// 订单跳过。修改只改总量与限价、不改变接受顺序，故修改过的订单仍按其最初
+// 接受的位置参与选择。没有可选订单时返回 nil。
+func (e *Engine) lastActiveBuyLocked(st *symbolState) *Order {
+	for i := len(st.buyOrderIDs) - 1; i >= 0; i-- {
+		o := e.orders[st.buyOrderIDs[i]]
+		if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
+			continue
 		}
-		return canceled, nil
+		if o.Remaining() > 0 {
+			return o
+		}
 	}
+	return nil
+}
 
-	// 从最后接受的买单开始撤销，直到 持仓 + 买单剩余量 <= 新限额。
-	for st.position+st.reservedBuy > max {
-		var target *Order
-		for i := len(st.buyOrderIDs) - 1; i >= 0; i-- {
-			o := e.orders[st.buyOrderIDs[i]]
-			if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
-				continue
-			}
-			if o.Remaining() > 0 {
-				target = o
-				break
-			}
+// enforcePositionLimitLocked 是设置新持仓限额后收敛超限的唯一撤单规则，
+// “持仓本身已超过新限额”和“加上有效买单剩余量才超过新限额”两种情形共用同一套
+// 有效买单判断与接受次序：只考虑该合约仍有未成交部分的买单，自最后接受的订单起
+// 每次撤销其全部剩余量（取消数量按当前总量减去已成交量计，现金按当前限价释放）。
+//   - 持仓本身已超过新限额时，撤掉该合约全部有效买单，但持仓继续保留、不自动卖出，
+//     撤销原因沿用持仓超限文案；
+//   - 否则在“已持仓数量 + 有效买单剩余量”不大于新限额后停止，恰好等于时保留
+//     较早的订单，撤销原因沿用限额下调文案。
+//
+// 其他合约买单、该合约卖单、已全部成交或已撤销的订单均不会被选中；未被选中的
+// 订单及其占用原样保留。返回按实际撤销顺序排列的订单编号，每张订单只撤销一次。
+func (e *Engine) enforcePositionLimitLocked(st *symbolState, max int64) []int64 {
+	holdingOver := st.position > max
+	var canceled []int64
+	for {
+		if !holdingOver && st.position+st.reservedBuy <= max {
+			return canceled // 普通超限已收敛；恰好用满额度时保留较早订单
 		}
+		target := e.lastActiveBuyLocked(st)
 		if target == nil {
-			break // 理论上不会发生：reservedBuy 与剩余买单不一致时兜底
+			return canceled // 无有效买单可撤（reservedBuy 与剩余买单不一致时兜底）
 		}
-		e.cancelLocked(target, fmt.Sprintf("持仓限额下调至 %d，撤销最后接受的剩余买单", max))
+		var reason string
+		if holdingOver {
+			reason = fmt.Sprintf("持仓 %d 已超过新限额 %d，撤销剩余买单", st.position, max)
+		} else {
+			reason = fmt.Sprintf("持仓限额下调至 %d，撤销最后接受的剩余买单", max)
+		}
+		e.cancelLocked(target, reason)
 		canceled = append(canceled, target.ID)
 	}
-	return canceled, nil
 }
 
 // UpdateQuote 提交合约报价。只有连续序号才能推进最新报价：
