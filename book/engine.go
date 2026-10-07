@@ -121,6 +121,22 @@ func (o Order) Remaining() int64 {
 	return o.Qty - o.Filled
 }
 
+// activeBuy 是“有效买单”的唯一判断，日内亏损保护撤单、账户总持仓金额计算与
+// 撤单、合约持仓限额下调撤单及行情补齐预检都经此判断哪些订单还有有效未成交部分：
+//
+//   - 待成交与部分成交的买单，只要仍有未成交部分（Remaining > 0）即为有效，
+//     继续参与相应的占用计算与撤单选择；
+//   - 全部成交或已撤销的订单不再参与（Remaining 已为 0）；卖单从不进入买单集合；
+//   - 修改过总量或限价的买单按当前参数与已成交量确定剩余量，是否有效随之变化，
+//     但其在合约接受序列（buyOrderIDs）中的位置不变，仍沿用最初接受的顺序。
+//
+// 各功能在此判断之上只叠加各自的集合范围（单合约接受序列或全账户订单）、
+// 撤销次序与停止条件。o 为 nil（订单不存在）时不是有效买单。
+func activeBuy(o *Order) bool {
+	return o != nil && o.Side == Buy &&
+		o.Status != StatusFilled && o.Status != StatusCanceled && o.Remaining() > 0
+}
+
 // Trade 是调用方提交的一笔成交。TradeID 由调用方给出且必须唯一，
 // 同一编号重复提交时按幂等规则处理（见 Engine.Fill）。
 type Trade struct {
@@ -527,7 +543,8 @@ func (e *Engine) SetMaxPosition(symbol string, max int64) ([]int64, error) {
 	st.maxPosition = max
 
 	// “持仓本身已超限”与“持仓加有效买单剩余才超限”共用同一套有效买单判断
-	// （lastActivePositionBuyLocked）、原先的接受次序与同一个撤单循环：
+	// （activeBuy，经 lastActivePositionBuyLocked 选择）、原先的接受次序与同一个
+	// 撤单循环：
 	// 每张订单都在选择当时重新判断是否仍可撤销，每次撤销其全部剩余量。
 	//   - 持仓本身已超过新限额：持续撤到该合约没有有效买单为止，持仓继续保留、
 	//     不自动平仓（st.position 不随撤单变化，故 holdingOver 只判定一次）；
@@ -551,19 +568,16 @@ func (e *Engine) SetMaxPosition(symbol string, max int64) ([]int64, error) {
 	return canceled, nil
 }
 
-// lastActivePositionBuyLocked 是合约持仓限额下调撤单时唯一的有效买单选择规则：
-// 在该合约的买单接受序列 st.buyOrderIDs（最早接受在前）上自后向前，返回最后接受
-// 的一张仍有未成交部分的买单。不存在、已全部成交或已撤销的订单一律跳过。
-// 其他合约的买单与该合约的卖单不在本合约的接受序列中，永远不会被选中；成功修改过
-// 总量或限价的订单仍按最初接受的位置参与，修改不视为重新下单。调用方每撤一张后
-// 都应重新调用，以按撤销当时的状态判断后续订单是否仍可撤销。调用时须持有引擎锁。
+// lastActivePositionBuyLocked 是合约持仓限额下调撤单时的买单选择规则：在该合约的
+// 买单接受序列 st.buyOrderIDs（最早接受在前）上自后向前，返回最后接受的一张有效
+// 买单（有效判断见 activeBuy，与全账户各功能共用同一规则，不存在、已全部成交或
+// 已撤销的订单一律跳过）。其他合约的买单与该合约的卖单不在本合约的接受序列中，
+// 永远不会被选中；成功修改过总量或限价的订单仍按最初接受的位置参与，修改不视为
+// 重新下单。调用方每撤一张后都应重新调用，以按撤销当时的状态判断后续订单是否仍
+// 可撤销。调用时须持有引擎锁。
 func (e *Engine) lastActivePositionBuyLocked(st *symbolState) *Order {
 	for i := len(st.buyOrderIDs) - 1; i >= 0; i-- {
-		o := e.orders[st.buyOrderIDs[i]]
-		if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
-			continue
-		}
-		if o.Remaining() > 0 {
+		if o := e.orders[st.buyOrderIDs[i]]; activeBuy(o) {
 			return o
 		}
 	}
@@ -1722,9 +1736,10 @@ func (e *Engine) positionValuationLocked(scope valuationScope) (positionValuatio
 		}
 
 		// 有效买单剩余量占用（仅账户金额上限口径）：
-		// Σ 剩余量 × buyReservedUnit(限价, 最新已生效报价)。同一合约同时有持仓和
-		// 买单时只贡献一次报价定位；只有有效买单的合约进入金额定位，但不会进入
-		// 日内净值的持仓报价定位（风险口径 withOrders=false）。
+		// Σ 剩余量 × buyReservedUnit(限价, 最新已生效报价)。有效买单判断与其他
+		// 功能共用 activeBuy；scope.canceled 中的编号在影子试算中视为已撤销。
+		// 同一合约同时有持仓和买单时只贡献一次报价定位；只有有效买单的合约进入
+		// 金额定位，但不会进入日内净值的持仓报价定位（风险口径 withOrders=false）。
 		if scope.withOrders && hasQuote {
 			var symReserved int64
 			for _, id := range st.buyOrderIDs {
@@ -1732,14 +1747,10 @@ func (e *Engine) positionValuationLocked(scope valuationScope) (positionValuatio
 					continue
 				}
 				o := e.orders[id]
-				if o == nil || o.Status == StatusFilled || o.Status == StatusCanceled {
+				if !activeBuy(o) {
 					continue
 				}
-				rem := o.Remaining()
-				if rem <= 0 {
-					continue
-				}
-				need, ok := mulPosInt64(rem, buyReservedUnit(hasQuote, q.Price, o.Limit))
+				need, ok := mulPosInt64(o.Remaining(), buyReservedUnit(hasQuote, q.Price, o.Limit))
 				if !ok {
 					return positionValuation{}, false
 				}
@@ -1882,10 +1893,10 @@ func (e *Engine) triggerRiskLocked(trigger RiskTrigger, refID, refMoment int64,
 		RiskQuoteRefs: refsCopy,
 	})
 
-	// 限制增险：撤销所有合约仍有未成交部分的买单，编号从大到小。
+	// 限制增险：撤销所有合约的有效买单（activeBuy），编号从大到小。
 	var ids []int64
 	for id, o := range e.orders {
-		if o.Side == Buy && o.Status != StatusCanceled && o.Status != StatusFilled && o.Remaining() > 0 {
+		if activeBuy(o) {
 			ids = append(ids, id)
 		}
 	}
@@ -2112,15 +2123,16 @@ func (e *Engine) PositionAmountStatus() PositionAmountStatus {
 	return st
 }
 
-// activeBuyIDsShadowLocked 返回全部仍有剩余量的买单编号，按编号从大到小排列；
-// simCanceled 中的编号视为已撤销（报价链预检时模拟本批此前各条报价造成的撤单）。
+// activeBuyIDsShadowLocked 返回全部有效买单（activeBuy）的编号，按编号从大到小
+// 排列；simCanceled 中的编号视为已撤销（报价链预检时模拟本批此前各条报价造成的
+// 撤单）。
 func (e *Engine) activeBuyIDsShadowLocked(simCanceled map[int64]bool) []int64 {
 	var ids []int64
 	for id, o := range e.orders {
 		if simCanceled != nil && simCanceled[id] {
 			continue
 		}
-		if o.Side == Buy && o.Status != StatusCanceled && o.Status != StatusFilled && o.Remaining() > 0 {
+		if activeBuy(o) {
 			ids = append(ids, id)
 		}
 	}
